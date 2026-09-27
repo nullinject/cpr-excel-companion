@@ -1,6 +1,6 @@
 # CPR Excel Companion
 
-**v0.4.0：官方 CPR 3.16.0 插件 + 独立桥接服务。数据面经 CPR 原生 Provider 执行，计费与用量统计完整；已在生产环境通过端到端验收（2026-09-27）。**
+**v0.8.2：官方 CPR 3.16.0 插件 + 独立桥接服务。数据面经 CPR 原生 Provider 执行，计费与用量统计完整；已在生产环境通过端到端验收（2026-09-27）。**
 
 协议转换移植自 [Kaixxrua/excel-codex-bridge](https://github.com/Kaixxrua/excel-codex-bridge)。无需修改 CPR 源码；由插件、桥接服务与上游路由三部分组成。
 
@@ -13,6 +13,15 @@ CPR 的 Codex HTTP 上游会发送 `Content-Encoding: zstd`。此前桥接直接
 同时修复未签名透传请求缺省 `stream` 字段时发生 panic、导致连接中断的问题。
 
 本修复需要更新并重启**桥接服务二进制**；仅更新 CPR 侧插件不会修复旧桥接。回归测试包含真实 HTTP 监听器下未签名、签名原生、签名 Excel 三条路径，不会请求真实上游。
+
+## v0.8.2 桥接：真实 Codex 客户端兼容
+
+- `generate=false` 预热在桥接本地建立有界续接历史，返回空输出、零用量；不向 Excel 发起生成请求。
+- 补齐原项目工具封装的兼容解码，保留已声明工具校验；流解析或工具转换失败时发送失败终态并保留原因，避免无原因断流。
+- 官方 CPR 3.16.0 部署必须保持 `openai.ws_pool.enabled: true`。关闭连接池会让 Codex 的首次 WebSocket 请求就收到 `previous_response_not_found` / `pool_unavailable`，随后反复重试和回退；普通 HTTP 探活无法发现此问题。
+- 插件仅绑定 `attempt` 和观察事件。官方 3.16.0 的 `request` 中间件 WebSocket 帧投影会导致 `request middleware returned an invalid response`；旧安装需移除该 request 绑定。该阶段也未提供客户端 Key，移除不会损失可用的身份信息。
+- 不要在账户凭据 JSON 中添加 `websockets` 字段：3.16.0 拒绝未知字段，导致凭据解析失败和 503。通过官方账户设置管理传输方式。
+- 原生 HTTP 上游不接受 `generate=false`，因此 Excel 预热在本地完成，不能简单改走原生 HTTP。
 
 ## 工作方式
 

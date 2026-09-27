@@ -145,26 +145,18 @@ impl Control {
     /// 2. 缺省跟随后缀语义（ctx.excel）；
     /// 3. accounts/models 粗粒度范围只约束 Excel 通道，原生透传不受并发预算约束。
     /// 4. 每个签名请求都留记录（含走原生的），侧边栏才能反映全量走向。
-    pub async fn enter(
-        self: &Arc<Self>,
-        ctx: &Context,
-        model: &str,
-        suffix: &str,
-        prewarm: bool,
-    ) -> Lease {
-        let base = model.strip_suffix(suffix).filter(|b| !b.is_empty()).unwrap_or(model);
+    pub async fn enter(self: &Arc<Self>, ctx: &Context, model: &str, suffix: &str) -> Lease {
+        let base = model
+            .strip_suffix(suffix)
+            .filter(|b| !b.is_empty())
+            .unwrap_or(model);
         let (excel, gate, guard) = {
             let mut i = self.lock();
             let channel = i.saved.policy.model_channels.get(base).copied();
-            // CPR 探针/预热（generate=false）不进 Excel 通道：Excel 无法预热，转原生。
-            let desired = if prewarm {
-                false
-            } else {
-                match channel {
-                    Some(crate::admission::Channel::Excel) => true,
-                    Some(crate::admission::Channel::Native) => false,
-                    None => ctx.excel,
-                }
+            let desired = match channel {
+                Some(crate::admission::Channel::Excel) => true,
+                Some(crate::admission::Channel::Native) => false,
+                None => ctx.excel,
             };
             let permitted = i.saved.policy.enabled
                 && i.saved.policy.models.permits(model)
@@ -473,12 +465,12 @@ mod tests {
             key: None,
             expires: 1,
         };
-        let first = c.enter(&ctx, "model", "-excel", false).await;
+        let first = c.enter(&ctx, "model", "-excel").await;
         assert!(matches!(c.save(p.clone(), Some(1)), Err((409, _))));
         let mut ctx2 = ctx.clone();
         ctx2.request_id = "r2".into();
         let other = c.clone();
-        let waiting = tokio::spawn(async move { other.enter(&ctx2, "model", "-excel", false).await });
+        let waiting = tokio::spawn(async move { other.enter(&ctx2, "model", "-excel").await });
         tokio::task::yield_now().await;
         assert_eq!(c.snapshot()["waiting"], 1);
         waiting.abort();

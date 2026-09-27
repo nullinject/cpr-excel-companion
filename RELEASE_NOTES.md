@@ -1,3 +1,17 @@
+# v0.8.2 真实 Codex 兼容修复
+
+- Excel 通道的 `generate=false` 预热在本地完成，返回空输出和零用量，并保留有界续接历史。修复原生 HTTP 透传返回 `Unsupported parameter: generate`。
+- 官方 CPR 3.16.0 仅绑定 attempt 中间件，避开 request 阶段 WebSocket 帧类型不匹配。升级旧实例时移除 request 绑定，保留 attempt 与两类 observation 绑定。
+- 移植原项目的工具封装解码：对象、代码围栏、嵌套传输及无效反斜杠；仅解析数据，仍拒绝未声明工具，不执行外层 JavaScript。
+- SSE 解码及工具转换失败写入监控失败原因，并发送明确的失败终态，避免表现为无原因断流；保留 v0.8.1 的 SSE 保活与 v0.8.0 的协议转换。
+- 部署要求 `openai.ws_pool.enabled: true`。不要向账户凭据 JSON 添加未定义的 `websockets` 字段，会导致整个凭据解析失败。
+
+验证：Rust 工作区 106 项测试通过，Clippy 零警告，Linux release 构建成功。实际 Codex CLI 0.158.0-alpha.2.1 使用真实 Key 验证 gpt-6-sol / gpt-6-astra 的写文件、执行测试、恢复会话和上下文记忆。账户容量和上游服务错误仍可能出现，不能保证永不重试。
+
+旧版本升级需同时更新桥接程序和插件绑定；只上传插件无法替换桥接二进制。操作前保留账户、策略与旧二进制备份。
+
+---
+
 # v0.4.0 混合架构
 
 官方 CPR 3.16.0 + attempt 插件 + 独立桥接。数据面经 CPR 原生 Provider 执行：认证、调度、重试、用量结算完整保留。控制面（管理页、观察归并）由插件进程内直连桥接。
