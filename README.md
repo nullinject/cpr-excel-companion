@@ -149,6 +149,16 @@ Rust 1.97.1，Node >=24 / pnpm 12.6.0。打包：官方 `cpr-plugin package --ma
 
 不记录请求正文、文件内容或令牌；拒绝远程图片 URL；内联附件有大小限制。未包含原项目的登录发现功能或 OfficeJS 执行器。
 
+## 致谢
+
+感谢以下开源项目及其作者：
+
+- [Kaixxrua/excel-codex-bridge](https://github.com/Kaixxrua/excel-codex-bridge)：本项目 Excel 协议转换与工具调用适配的移植来源，感谢作者的原始实现与开源分享。
+- [zyycn/codex-proxy-rs](https://github.com/zyycn/codex-proxy-rs)：提供 CPR 宿主、插件 SDK，以及账户调度、代理、计费和用量统计等基础能力。
+- [zyycn/codex-proxy-plugins](https://github.com/zyycn/codex-proxy-plugins)：感谢作者公开官方插件模板与示例，为插件开发提供参考。
+
+第三方代码的来源、版本与许可证详见 [NOTICE.md](NOTICE.md)。
+
 ## 许可
 
 主体采用 Unlicense。第三方来源、固定版本及官方 SDK 的 Apache-2.0 许可见 [NOTICE.md](NOTICE.md) 和 `vendor/gateway-plugin-sdk/LICENSE`。
