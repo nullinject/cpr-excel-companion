@@ -183,6 +183,10 @@ impl Translator {
 }
 
 pub fn encode(event: &Value) -> Vec<u8> {
+    // SSE 注释：桥接保活心跳借道输出，所有合规解析器都忽略注释行。
+    if event["type"] == "bridge.comment" {
+        return format!(": {}\n\n", event["text"].as_str().unwrap_or("keepalive")).into_bytes();
+    }
     format!(
         "event: {}\ndata: {}\n\n",
         event["type"].as_str().unwrap_or("error"),
