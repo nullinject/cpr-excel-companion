@@ -274,18 +274,17 @@ async fn events(
         .and_then(Value::as_str)
         .ok_or_else(|| fail(StatusCode::BAD_REQUEST, "model is required"))?
         .to_owned();
-    let lease = app
-        .control
-        .clone()
-        .enter(&ctx, &model)
-        .await
-        .map_err(|e| fail(StatusCode::TOO_MANY_REQUESTS, e))?;
-    ctx.excel = lease.is_some();
+    let lease = app.control.enter(&ctx, &model, &app.suffix).await;
+    if lease.rejected {
+        return Err(fail(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Excel concurrency or queue limit reached",
+        ));
+    }
+    ctx.excel = lease.excel;
     // 早期失败的桥接侧原因也写入记录，便于侧边栏排障。
     let note = |message: String| {
-        if let Some(lease) = lease.as_ref() {
-            lease.fail(&message);
-        }
+        lease.fail(&message);
         eprintln!("bridge request {} failed: {message}", ctx.request_id);
     };
     let client = match client(&app, &ctx) {
@@ -342,7 +341,15 @@ async fn events(
     } else {
         tools = BTreeMap::new();
         original_input = vec![];
-        source["stream"] = json!(true);
+        if let Some(object) = source.as_object_mut() {
+            // 通道覆盖为原生时收到的可能带后缀；上游不认识，统一还原。
+            if let Some(Value::String(m)) = object.get("model") && let Some(base) =
+                m.strip_suffix(&app.suffix).filter(|b| !b.is_empty())
+            {
+                object.insert("model".into(), json!(base));
+            }
+            object.insert("stream".into(), json!(true));
+        }
         body = source;
     }
     let endpoint = if ctx.excel {
@@ -394,7 +401,7 @@ async fn events(
                 let output = match output { Ok(v) => v, Err(e) => { yield Err(e); return; } };
                 for event in output {
                     terminal = matches!(event["type"].as_str(), Some("response.completed"|"response.failed"|"response.incomplete"));
-                    if terminal && let Some(lease) = lease.as_ref() { lease.terminal(&event); }
+                    if terminal { lease.terminal(&event); }
                     if terminal && ctx.excel {
                         excel::history::save(&scope, &original_input, &event["response"]);
                         excel::cache_save(&scope, &translator.originals);

@@ -49,6 +49,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let observe_secret = control_secret.clone();
     let observe_url = control_url.clone();
     let show_page = config["showPage"].as_bool().unwrap_or(true);
+    let plugin_info = Arc::new(serde_json::json!({
+        "excelEnabled": enabled,
+        "excelMode": mode,
+        "excelModelSuffix": suffix,
+        "isolationScope": scope,
+    }));
     let plugin = PluginBuilder::from_json(include_bytes!("../plugin.json"))?
         .middleware(move |mut call| {
             let secret = secret.clone();
@@ -131,7 +137,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .management(management::registration(show_page), move |call| {
             let secret = control_secret.clone();
             let url = control_url.clone();
-            async move { management::handle(call, &url, &secret).await }
+            let info = plugin_info.clone();
+            async move { management::handle(call, &url, &secret, &info).await }
         })?
         .build()?;
     session.run(plugin).await?;

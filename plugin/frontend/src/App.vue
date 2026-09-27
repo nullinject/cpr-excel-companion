@@ -8,6 +8,7 @@ interface Policy {
   models: Scope
   accounts: Scope
   client_keys: Scope
+  model_channels: Record<string, 'excel' | 'native'>
   concurrency: number
   overflow: 'queue' | 'reject'
   queue_capacity: number
@@ -27,6 +28,7 @@ interface Row {
   error_code: string | null
   upstream_model: string | null
   source: string
+  excel: boolean
 }
 interface Snapshot { policy: Policy, version: number | null, active: number, waiting: number, records: Row[] }
 
@@ -39,6 +41,7 @@ const saving = ref(false)
 const tab = ref<'monitor' | 'settings'>('monitor')
 const filter = ref('')
 const options = ref<{ accounts: { account_id: string, enabled: boolean }[], keys: { id: string, name: string, enabled: boolean }[] }>({ accounts: [], keys: [] })
+const pluginInfo = ref<{ excelEnabled: boolean, excelMode: string, excelModelSuffix: string, isolationScope: string } | null>(null)
 const newModel = ref('')
 
 const keyNames = computed(() => {
@@ -52,14 +55,28 @@ function keyLabel(id: string | null): string {
     return '未签名'
   return keyNames.value.get(id) ?? id.slice(0, 14) + '…'
 }
+function baseName(model: string): string {
+  const suffix = pluginInfo.value?.excelModelSuffix ?? '-excel'
+  return model.endsWith(suffix) && model.length > suffix.length ? model.slice(0, -suffix.length) : model
+}
+function modelState(model: string): 'suffix' | 'excel' | 'native' {
+  return policy.value?.model_channels[model] ?? 'suffix'
+}
+function setModelState(model: string, state: 'suffix' | 'excel' | 'native') {
+  const p = policy.value
+  if (!p) return
+  if (state === 'suffix')
+    delete p.model_channels[model]
+  else
+    p.model_channels[model] = state
+}
 const knownModels = computed(() => {
   const set = new Set<string>()
   for (const row of snapshot.value?.records ?? []) {
     if (row.model)
-      set.add(row.model)
+      set.add(baseName(row.model))
   }
-  for (const m of policy.value?.models.deny ?? []) set.add(m)
-  for (const m of policy.value?.models.allow ?? []) set.add(m)
+  for (const m of Object.keys(policy.value?.model_channels ?? {})) set.add(m)
   return [...set].sort()
 })
 const accountList = computed(() => {
@@ -69,22 +86,9 @@ const accountList = computed(() => {
   for (const id of policy.value?.accounts.deny ?? []) if (!map.has(id)) map.set(id, true)
   return [...map.entries()].map(([id, enabled]) => ({ id, enabled }))
 })
-function modelChannel(model: string): 'excel' | 'native' {
-  const p = policy.value
-  if (!p) return 'excel'
-  if (p.models.deny.includes(model)) return 'native'
-  if (p.models.allow.length > 0 && !p.models.allow.includes(model)) return 'native'
-  return 'excel'
-}
-function setModelChannel(model: string, channel: 'excel' | 'native') {
-  const p = policy.value
-  if (!p) return
-  p.models.deny = p.models.deny.filter(m => m !== model)
-  if (channel === 'native') {
-    p.models.deny.push(model)
-  } else if (p.models.allow.length > 0) {
-    p.models.allow = [...new Set([...p.models.allow, model])]
-  }
+function channelTextOf(model: string): string {
+  const state = modelState(model)
+  return state === 'excel' ? 'Excel' : state === 'native' ? '原生' : '跟随后缀'
 }
 function accountAllowed(id: string): boolean {
   const p = policy.value
@@ -133,22 +137,44 @@ async function loadOptions() {
     options.value = await api('api/options')
   }
   catch { /* 选项加载失败不阻塞页面，Key 显示退回 ID */ }
+  try {
+    pluginInfo.value = await api('api/plugin-info')
+  }
+  catch { /* 同上 */ }
 }
 const stats = computed(() => {
   const rows = snapshot.value?.records ?? []
   let excel = 0
   let excelFailed = 0
   let passthrough = 0
+  let native = 0
   for (const row of rows) {
-    if (row.source === 'unsigned') {
+    if (row.excel) {
+      if (row.status === 'succeeded' || row.status === 'completed')
+        excel += 1
+      else
+        excelFailed += 1
+    } else if (row.source === 'unsigned') {
       passthrough += 1
     } else if (row.status === 'succeeded' || row.status === 'completed') {
-      excel += 1
-    } else {
-      excelFailed += 1
+      native += 1
     }
   }
-  return { excel, excelFailed, passthrough, total: rows.length }
+  return { excel, excelFailed, passthrough, native, total: rows.length }
+})
+const learnedKeys = computed(() => {
+  const counts = new Map<string, { excel: number, native: number }>()
+  for (const row of snapshot.value?.records ?? []) {
+    if (!row.client_key_id || row.client_key_id === 'unsigned')
+      continue
+    const entry = counts.get(row.client_key_id) ?? { excel: 0, native: 0 }
+    if (row.excel)
+      entry.excel += 1
+    else
+      entry.native += 1
+    counts.set(row.client_key_id, entry)
+  }
+  return [...counts.entries()].map(([id, c]) => ({ id, name: keyNames.value.get(id) ?? id.slice(0, 14) + '…', ...c })).sort((a, b) => b.excel + b.native - (a.excel + a.native))
 })
 function rows() {
   return snapshot.value?.records.filter((row) => {
@@ -174,8 +200,8 @@ function statusText(row: Row): string {
 }
 function channelText(row: Row): string {
   if (row.source === 'unsigned') return '原生透传'
-  if (row.source === 'host') return '宿主观察'
-  return 'Excel'
+  if (row.source === 'host') return '仅观察'
+  return row.excel ? 'Excel' : '原生'
 }
 async function save() {
   saving.value = true
@@ -237,7 +263,11 @@ onUnmounted(() => {
         </div>
         <div class="card">
           <div class="num">{{ stats.passthrough }}</div>
-          <div class="label">原生透传</div>
+          <div class="label">未签名透传</div>
+        </div>
+        <div class="card">
+          <div class="num">{{ stats.native }}</div>
+          <div class="label">已签名走原生</div>
         </div>
         <div class="card">
           <div class="num">{{ stats.total }}</div>
@@ -263,9 +293,7 @@ onUnmounted(() => {
                 <td>
                   {{ row.model }}<small v-if="row.upstream_model && row.upstream_model !== row.model">→ {{ row.upstream_model }}</small>
                 </td>
-                <td>
-                  {{ channelText(row) }}<small v-if="row.source === 'host'">仅观察</small>
-                </td>
+                <td>{{ channelText(row) }}</td>
                 <td :class="{ bad: ['failed', 'rejected', 'rejected_capacity'].includes(row.status) }">
                   {{ statusText(row) }}
                 </td>
@@ -304,23 +332,24 @@ onUnmounted(() => {
 
       <BaseCard>
         <div class="card-title">
-          模型通道
-          <small>每个模型走 Excel 还是原生；此处的"原生"对已签名和未签名请求都生效</small>
+          模型通道（按基础模型名）
+          <small>跟随后缀 = 客户端用带 -excel 的名字走 Excel；Excel = 无后缀也强制走 Excel；原生 = 带 -excel 后缀也压回原生。对签名与未签名请求都生效。</small>
         </div>
         <div class="chips">
-          <div v-for="model in knownModels" :key="model" class="chip" :class="modelChannel(model) === 'excel' ? 'on' : 'off'">
+          <div v-for="model in knownModels" :key="model" class="chip model" :class="'state-' + modelState(model)">
             <span class="chip-name">{{ model }}</span>
-            <span class="chip-state">{{ modelChannel(model) === 'excel' ? 'Excel' : '原生' }}</span>
-            <button type="button" class="chip-btn" @click="setModelChannel(model, modelChannel(model) === 'excel' ? 'native' : 'excel')">
-              切换
-            </button>
+            <span class="seg">
+              <button type="button" class="seg-btn" :class="{ active: modelState(model) === 'suffix' }" @click="setModelState(model, 'suffix')">跟随后缀</button>
+              <button type="button" class="seg-btn" :class="{ active: modelState(model) === 'excel' }" @click="setModelState(model, 'excel')">Excel</button>
+              <button type="button" class="seg-btn" :class="{ active: modelState(model) === 'native' }" @click="setModelState(model, 'native')">原生</button>
+            </span>
           </div>
           <span v-if="knownModels.length === 0" class="muted">暂无已知模型，发起请求后出现在这里</span>
         </div>
         <div class="grid">
           <label>添加模型 <input v-model="newModel" placeholder="模型名，如 gpt-5.6-sol"></label>
-          <button type="button" class="add-btn" @click="if (newModel.trim()) { setModelChannel(newModel.trim(), 'excel'); newModel = '' }">
-            添加为 Excel
+          <button type="button" class="add-btn" @click="if (newModel.trim()) { setModelState(newModel.trim(), 'excel'); newModel = '' }">
+            添加并强制 Excel
           </button>
         </div>
       </BaseCard>
@@ -342,8 +371,24 @@ onUnmounted(() => {
 
       <BaseCard>
         <div class="card-title">
-          按 Key 授权
-          <small>哪些 Key 能使用 Excel 通道，由 CPR 插件实例的「绑定」控制：绑定 clientKeyIds 与 models 后，命中的请求走 Excel，未命中的自动原生透传。在 CPR 插件实例编辑器中修改，保存即生效。</small>
+          插件设置（在 CPR 插件实例编辑器中修改）
+          <small v-if="pluginInfo">
+            excelMode={{ pluginInfo.excelMode }} · 模型后缀={{ pluginInfo.excelModelSuffix }} · 总开关={{ pluginInfo.excelEnabled ? '开' : '关' }} · 作用域={{ pluginInfo.isolationScope }}
+          </small>
+        </div>
+      </BaseCard>
+
+      <BaseCard>
+        <div class="card-title">
+          按 Key 授权（学到的使用情况）
+          <small>哪些 Key 能使用 Excel 通道由 CPR 插件实例的「绑定」决定：绑定 clientKeyIds 后命中的请求可走 Excel，未绑定自动原生透传。下表是最近请求里实际出现过的 Key。</small>
+        </div>
+        <div class="chips">
+          <div v-for="key in learnedKeys" :key="key.id" class="chip">
+            <span class="chip-name">{{ key.name }}</span>
+            <span class="chip-state">Excel {{ key.excel }} 次 · 原生 {{ key.native }} 次</span>
+          </div>
+          <span v-if="learnedKeys.length === 0" class="muted">暂无数据</span>
         </div>
       </BaseCard>
 
@@ -459,6 +504,33 @@ label {
 .chip-state {
   color: var(--cp-color-text-secondary);
   font-size: 12px;
+}
+.seg {
+  display: inline-flex;
+  gap: 0;
+}
+.seg-btn {
+  font: inherit;
+  font-size: 12px;
+  border: 1px solid var(--cp-color-border, #8886);
+  background: var(--cp-color-bg-container, transparent);
+  color: inherit;
+  cursor: pointer;
+  padding: 2px 8px;
+}
+.seg-btn + .seg-btn {
+  border-left: none;
+}
+.seg-btn.active {
+  background: var(--cp-color-primary, #06f);
+  color: #fff;
+  border-color: var(--cp-color-primary, #06f);
+}
+.chip.model.state-excel {
+  border-color: var(--cp-color-success, #2e7d32);
+}
+.chip.model.state-native {
+  border-color: var(--cp-color-error, #b42318);
 }
 .chip-btn {
   font: inherit;

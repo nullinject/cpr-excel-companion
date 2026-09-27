@@ -37,6 +37,8 @@ struct Record {
     error_code: Option<String>,
     /// 记录来源：bridge=桥接自查，host=仅宿主观察（请求未到桥接已失败等）。
     source: &'static str,
+    /// 该请求最终是否走 Excel 通道。
+    excel: bool,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -131,21 +133,40 @@ impl Control {
         i.gate = gate;
         Ok(json!({"version":i.saved.version}))
     }
+    /// 签名请求的通道解析与准入：
+    ///
+    /// 1. model_channels 按基础模型名覆盖（Excel=无后缀强制走 Excel；Native=带后缀压回原生）；
+    /// 2. 缺省跟随后缀语义（ctx.excel）；
+    /// 3. accounts/models 粗粒度范围只约束 Excel 通道，原生透传不受并发预算约束。
+    /// 4. 每个签名请求都留记录（含走原生的），侧边栏才能反映全量走向。
     pub async fn enter(
-        self: Arc<Self>,
+        self: &Arc<Self>,
         ctx: &Context,
         model: &str,
-    ) -> Result<Option<Lease>, &'static str> {
-        let gate = {
+        suffix: &str,
+    ) -> Lease {
+        let base = model.strip_suffix(suffix).filter(|b| !b.is_empty()).unwrap_or(model);
+        let (excel, gate, guard) = {
             let mut i = self.lock();
-            if !ctx.excel
-                || !i.saved.policy.permits_request(model, Some(&ctx.scope))
-                || !i.saved.policy.accounts.permits(&ctx.account)
-            {
-                return Ok(None);
-            }
+            let channel = i.saved.policy.model_channels.get(base).copied();
+            let desired = match channel {
+                Some(crate::admission::Channel::Excel) => true,
+                Some(crate::admission::Channel::Native) => false,
+                None => ctx.excel,
+            };
+            let permitted = i.saved.policy.enabled
+                && i.saved.policy.models.permits(model)
+                && i.saved.policy.accounts.permits(&ctx.account);
+            let excel = desired && permitted;
             if !i.active.insert(ctx.request_id.clone()) {
-                return Err("duplicate active request");
+                return Lease {
+                    control: self.clone(),
+                    id: ctx.request_id.clone(),
+                    _permit: None,
+                    _active: None,
+                    excel: false,
+                    rejected: true,
+                };
             }
             i.records.retain(|r| r.request_id != ctx.request_id);
             i.records.push_front(Record {
@@ -162,30 +183,43 @@ impl Control {
                 upstream_model: None,
                 error_code: None,
                 source: "bridge",
+                excel,
             });
             while i.records.len() > 1000 {
                 i.records.pop_back();
             }
-            i.gate.clone()
+            let guard = ActiveGuard {
+                control: self.clone(),
+                id: ctx.request_id.clone(),
+            };
+            (excel, i.gate.clone(), Some(guard))
         };
-        let mut lease = Lease {
+        let permit = if excel {
+            match gate.acquire().await {
+                Ok(permit) => {
+                    self.update(&ctx.request_id, |r| {
+                        r.status = "running".into();
+                        r.queue_ms = Some(now().saturating_sub(r.started_at_ms));
+                    });
+                    Some(permit)
+                }
+                Err(_) => {
+                    self.update(&ctx.request_id, |r| r.status = "rejected_capacity".into());
+                    None
+                }
+            }
+        } else {
+            self.update(&ctx.request_id, |r| r.status = "running".into());
+            None
+        };
+        let rejected = excel && permit.is_none();
+        Lease {
             control: self.clone(),
-            id: ctx.request_id.clone(),
-            permit: None,
-        };
-        match gate.acquire().await {
-            Ok(permit) => {
-                lease.permit = Some(permit);
-                self.update(&lease.id, |r| {
-                    r.status = "running".into();
-                    r.queue_ms = Some(now().saturating_sub(r.started_at_ms));
-                });
-                Ok(Some(lease))
-            }
-            Err(_) => {
-                self.update(&lease.id, |r| r.status = "rejected_capacity".into());
-                Err("Excel concurrency or queue limit reached")
-            }
+            id: ctx.request_id.to_owned(),
+            _permit: permit,
+            _active: guard,
+            excel,
+            rejected,
         }
     }
     fn update(&self, id: &str, f: impl FnOnce(&mut Record)) {
@@ -215,6 +249,7 @@ impl Control {
             upstream_model: None,
             error_code: None,
             source: "unsigned",
+            excel: false,
         });
         while i.records.len() > 1000 {
             i.records.pop_back();
@@ -305,6 +340,7 @@ impl Control {
                 .as_ref()
                 .and_then(|f| f.upstream_status_code.map(|s| format!("upstream status {s}"))),
             upstream_model: observation.upstream_model.clone(),
+            excel: true,
             error_code: observation
                 .terminal
                 .as_ref()
@@ -322,10 +358,24 @@ impl Control {
         }
     }
 }
+/// active 集合的 Drop 守卫：排队请求被取消（future 中止）时也能清理。
+struct ActiveGuard {
+    control: Arc<Control>,
+    id: String,
+}
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        self.control.lock().active.remove(&self.id);
+    }
+}
 pub struct Lease {
     control: Arc<Control>,
     id: String,
-    permit: Option<OwnedSemaphorePermit>,
+    _permit: Option<OwnedSemaphorePermit>,
+    _active: Option<ActiveGuard>,
+    /// 本次请求的最终通道；rejected = 需要 Excel 但并发/队列拒绝。
+    pub excel: bool,
+    pub rejected: bool,
 }
 impl Lease {
     pub fn terminal(&self, event: &Value) {
@@ -399,12 +449,12 @@ mod tests {
             excel: true,
             expires: 1,
         };
-        let first = c.clone().enter(&ctx, "model").await.unwrap().unwrap();
+        let first = c.enter(&ctx, "model", "-excel").await;
         assert!(matches!(c.save(p.clone(), Some(1)), Err((409, _))));
-        let other = c.clone();
         let mut ctx2 = ctx.clone();
         ctx2.request_id = "r2".into();
-        let waiting = tokio::spawn(async move { other.enter(&ctx2, "model").await });
+        let other = c.clone();
+        let waiting = tokio::spawn(async move { other.enter(&ctx2, "model", "-excel").await });
         tokio::task::yield_now().await;
         assert_eq!(c.snapshot()["waiting"], 1);
         waiting.abort();
