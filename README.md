@@ -4,6 +4,16 @@
 
 协议转换移植自 [Kaixxrua/excel-codex-bridge](https://github.com/Kaixxrua/excel-codex-bridge)。无需修改 CPR 源码；由插件、桥接服务与上游路由三部分组成。
 
+## v0.6.2 修复：HTTP 请求压缩
+
+CPR 的 Codex HTTP 上游会发送 `Content-Encoding: zstd`。此前桥接直接将压缩正文按 JSON 解析，导致 `400 invalid JSON request`，客户端可能随之重连；这类错误不能作为模型能力下降的证据。
+
+桥接现在先解压再解析，同时从重新序列化的上游请求中去掉旧 `Content-Encoding` / `Content-Length`。普通与 Excel 通道均适用。压缩前、解压后正文上限均为 32 MiB，zstd 窗口上限为 32 MiB；损坏压缩包返回 400，超限返回 413，不支持或叠加的编码返回 415。
+
+同时修复未签名透传请求缺省 `stream` 字段时发生 panic、导致连接中断的问题。
+
+本修复需要更新并重启**桥接服务二进制**；仅更新 CPR 侧插件不会修复旧桥接。回归测试包含真实 HTTP 监听器下未签名、签名原生、签名 Excel 三条路径，不会请求真实上游。
+
 ## 工作方式
 
 ```text
