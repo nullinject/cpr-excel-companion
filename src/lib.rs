@@ -4,6 +4,7 @@ pub mod attachments;
 pub mod auth;
 pub mod control;
 pub mod history;
+pub mod observe;
 pub mod stream;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};

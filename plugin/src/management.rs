@@ -1,9 +1,10 @@
-//! 页面只使用官方宿主桥；桥接控制调用使用受管 HTTP 回调和逐请求签名。
+//! 页面只使用官方宿主桥读取 Key/账户；桥接控制调用走进程内直连和逐请求签名。
+use crate::dial;
 use cpr_excel_companion::auth::{Context, sign};
 use gateway_plugin_sdk::{
     ErrorCode, PluginFault,
     call::{
-        host::{HttpRequest, HttpResponse, KeyListRequest, KeyListResult},
+        host::{KeyListRequest, KeyListResult},
         management::{
             ManagementPage, ManagementRegistration, ManagementRequest, ManagementResource,
             ManagementResponse, ManagementRoute,
@@ -18,7 +19,7 @@ fn fault(message: &str) -> PluginFault {
     PluginFault::new(ErrorCode::InvalidInput, message)
 }
 pub async fn remote(
-    host: &HostClient,
+    _host: &HostClient,
     url: &str,
     secret: &[u8],
     id: &str,
@@ -41,25 +42,17 @@ pub async fn remote(
         expires: now + 30,
     };
     let token = sign(&context, secret).map_err(fault)?;
-    let request = HttpRequest {
-        method: "POST".into(),
-        url: format!("{}/{operation}", url.trim_end_matches('/')),
-        headers: vec![
+    let reply = dial::post(
+        &format!("{}/{operation}", url.trim_end_matches('/')),
+        vec![
             ("authorization".into(), format!("Bridge {token}")),
             ("content-type".into(), "application/json".into()),
         ],
-    };
-    let reply = host
-        .call(
-            "host.http.do",
-            serde_json::to_value(request).map_err(|_| fault("invalid control request"))?,
-            payload,
-        )
-        .await
-        .map_err(SessionError::into_plugin_fault)?;
-    let response: HttpResponse =
-        serde_json::from_value(reply.result).map_err(|_| fault("invalid bridge response"))?;
-    Ok((response.status, reply.payload))
+        payload,
+    )
+    .await
+    .map_err(|message| fault(&message))?;
+    Ok((reply.status, reply.body))
 }
 fn reply(status: u16, payload: Vec<u8>) -> TypedReply<ManagementResponse> {
     TypedReply::new(ManagementResponse {
@@ -113,6 +106,7 @@ pub async fn handle(
     let (operation, payload) = match (call.request.method.as_str(), call.request.path.as_str()) {
         ("GET", "api/snapshot") if call.payload.is_empty() => ("snapshot", b"{}".to_vec()),
         ("POST", "api/policy") => ("policy", call.payload),
+        ("POST", "api/observe") => ("observe", call.payload),
         _ => return Ok(reply(404, br#"{"error":"not found"}"#.to_vec())),
     };
     let (status, payload) = remote(
@@ -144,6 +138,12 @@ pub fn registration(show_page: bool) -> ManagementRegistration {
             ManagementRoute {
                 method: "POST".into(),
                 path: "api/policy".into(),
+                request_content_types: vec!["application/json".into()],
+                response_content_types: vec!["application/json".into()],
+            },
+            ManagementRoute {
+                method: "POST".into(),
+                path: "api/observe".into(),
                 request_content_types: vec!["application/json".into()],
                 response_content_types: vec!["application/json".into()],
             },

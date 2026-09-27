@@ -1,11 +1,23 @@
-# v0.1.1 实验性预发布
+# v0.4.0 混合架构
 
-面向未修改的官方 CPR 3.16.0 的 Excel 中间件插件和独立桥接服务，协议转换移植自 Kaixxrua/excel-codex-bridge。需要同时安装两部分，保留普通模型名。
+官方 CPR 3.16.0 + attempt 插件 + 独立桥接。数据面经 CPR 原生 Provider 执行：认证、调度、重试、用量结算完整保留。控制面（管理页、观察归并）由插件进程内直连桥接。
 
-此前 0.1.0 原型已在官方宿主验证 HTTP 请求、原生 WebSocket 上游、计费记录、客户端 WebSocket 和续接。0.1.1 增加管理页、策略与队列模块、逐消息签名；新增功能尚未完成端到端验收。
+## 相对 0.1.1 的变更
 
-**不适合直接替换多用户生产服务。** 多 Key 隔离、代理自动同步、严格拒绝语义和完整管理联动尚未验收，详见 README。当前发布不意味着已切换线上服务。
+- `-excel` 后缀模型自动识别并签名。宿主按请求元数据覆写正文 model 字段，插件只判定不改写，后缀由桥接还原。
+- 声明 request_lifecycle 与 usage 观察：宿主终态（真实 client_key 身份、上游模型、错误码）转发到桥接，归并进请求记录。
+- 桥接新增 `/_control/observe`；连接失败、上游拒绝等失败路径的原因写入记录并返回给宿主。
+- 插件控制通道改为进程内直连（trustedProcess 原生 TCP）。宿主受管 HTTP 禁止回环与私网地址，共享 netns 部署只能直连。
+- 桥接补齐原项目的 x-stainless 指纹头；UA 经 `EXCEL_BRIDGE_UPSTREAM_UA` 覆盖。
+- 账户映射容忍同步脚本的 version 元数据字段。
 
-验证：cargo test --workspace --locked（90 项含 SDK 和文档测试）；cargo clippy --workspace --all-targets --locked -- -D warnings；前端 pnpm build / pnpm lint；pnpm audit --prod 未发现已知漏洞。
+## 部署形态（生产实测 2026-09-27）
 
-资产提供 Linux x86_64 插件包、独立桥接程序和 SHA256SUMS。安装需要配置签名密钥、私有账户代理映射、上游路由和可写策略目录；没有一键生产安装器。
+- CPR 官方镜像 ghcr.io/zyycn/codex-proxy-rs:3.16.0，`openai.api.base_url` 指向反代公网路由。
+- 桥接以 `network_mode: service:codex-proxy-rs` 共享网络命名空间，端口由 CPR 服务发布；CPR 容器重建后需重建桥接容器。
+- 账户映射由 systemd timer 每 5 分钟从 CPR 数据库同步；挂载目录而非单文件。
+- 第一代 local.excel-bps 插件实例已停用：官方宿主的 envelope 校验拒绝短路响应。
+
+## 验证
+
+生产实测通过：原生透传、Excel 非流式（sol/terra）、Excel 流式（astra，WebSocket 上游）、model_requests 用量与计费、侧边栏观察归并。`cargo test --workspace --locked` 与 `cargo clippy -D warnings` 全绿；前端 pnpm build / lint 通过。

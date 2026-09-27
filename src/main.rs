@@ -33,11 +33,15 @@ struct Account {
 #[serde(deny_unknown_fields)]
 struct Config {
     accounts: BTreeMap<String, Account>,
+    /// 同步脚本写入的元数据；桥接只读 accounts。
+    #[serde(default)]
+    version: Option<String>,
 }
 struct App {
     secret: Vec<u8>,
     config_path: String,
     control: Arc<excel::control::Control>,
+    suffix: String,
 }
 fn fail(status: StatusCode, message: &'static str) -> Failure {
     (
@@ -107,6 +111,7 @@ fn upstream_headers(incoming: &HeaderMap, is_excel: bool) -> Result<HeaderMap, F
     let mut headers = HeaderMap::new();
     if !is_excel {
         // 原链路保留 CPR 生成的业务身份头；桥接鉴权和逐跳传输头不可发往上游。
+        // 反代/CDN 注入的头（forwarded 系、cf-*）会让上游风控，一并剥离。
         for (name, value) in incoming {
             let n = name.as_str();
             if !matches!(
@@ -118,7 +123,14 @@ fn upstream_headers(incoming: &HeaderMap, is_excel: bool) -> Result<HeaderMap, F
                     | "transfer-encoding"
                     | "accept-encoding"
                     | "x-excel-bridge-context"
+                    | "x-forwarded-for"
+                    | "x-forwarded-host"
+                    | "x-forwarded-proto"
+                    | "x-real-ip"
+                    | "cdn-loop"
+                    | "forwarded"
             ) && !n.starts_with("sec-websocket-")
+                && !n.starts_with("cf-")
             {
                 headers.insert(name.clone(), value.clone());
             }
@@ -148,14 +160,12 @@ fn upstream_headers(incoming: &HeaderMap, is_excel: bool) -> Result<HeaderMap, F
     headers.insert("content-type", "application/json".parse().unwrap());
     headers.insert("accept", "text/event-stream".parse().unwrap());
     if is_excel {
+        // 头集合对齐 excel-codex-bridge 的加载项指纹；UA 可按部署覆盖。
+        let ua = std::env::var("EXCEL_BRIDGE_UPSTREAM_UA").unwrap_or_else(|_| "Mozilla/5.0".into());
         for (name, value) in [
             ("x-basispoints-auth-mode", "chatgpt"),
             ("origin", "https://bps.openai.com"),
-            ("user-agent", "Mozilla/5.0"),
-            (
-                "x-openai-internal-basispoints-client-agent-profile",
-                "excel",
-            ),
+            ("x-openai-internal-basispoints-client-agent-profile", "excel"),
             ("x-openai-internal-basispoints-client-editor", "excel"),
             ("x-openai-internal-basispoints-client-host", "office"),
             ("x-openai-internal-basispoints-client-platform", "excel"),
@@ -167,9 +177,16 @@ fn upstream_headers(incoming: &HeaderMap, is_excel: bool) -> Result<HeaderMap, F
             ("x-openai-internal-basispoints-client-runtime", "desktop"),
             ("x-openai-internal-basispoints-office-host", "Excel"),
             ("x-openai-internal-basispoints-office-platform", "PC"),
+            ("x-stainless-arch", "unknown"),
+            ("x-stainless-lang", "js"),
+            ("x-stainless-os", "Unknown"),
+            ("x-stainless-package-version", "6.31.0"),
+            ("x-stainless-retry-count", "0"),
+            ("x-stainless-runtime", "browser:chrome"),
         ] {
             headers.insert(name, value.parse().unwrap());
         }
+        headers.insert("user-agent", ua.parse().unwrap());
         if let Some(account) = headers.get("chatgpt-account-id").cloned() {
             headers.insert("x-openai-account-id", account);
         }
@@ -212,16 +229,40 @@ async fn events(
     let model = source
         .get("model")
         .and_then(Value::as_str)
-        .ok_or_else(|| fail(StatusCode::BAD_REQUEST, "model is required"))?;
+        .ok_or_else(|| fail(StatusCode::BAD_REQUEST, "model is required"))?
+        .to_owned();
     let lease = app
         .control
         .clone()
-        .enter(&ctx, model)
+        .enter(&ctx, &model)
         .await
         .map_err(|e| fail(StatusCode::TOO_MANY_REQUESTS, e))?;
     ctx.excel = lease.is_some();
-    let client = client(&app, &ctx)?;
-    let headers = upstream_headers(&headers, ctx.excel)?;
+    // 早期失败的桥接侧原因也写入记录，便于侧边栏排障。
+    let note = |message: String| {
+        if let Some(lease) = lease.as_ref() {
+            lease.fail(&message);
+        }
+        eprintln!("bridge request {} failed: {message}", ctx.request_id);
+    };
+    let client = match client(&app, &ctx) {
+        Ok(client) => client,
+        Err((status, error)) => {
+            let message = error["error"]["message"]
+                .as_str()
+                .unwrap_or("client build failed")
+                .to_owned();
+            note(message);
+            return Err((status, error));
+        }
+    };
+    let headers = match upstream_headers(&headers, ctx.excel) {
+        Ok(headers) => headers,
+        Err((status, error)) => {
+            note("upstream headers rejected".into());
+            return Err((status, error));
+        }
+    };
     let scope = serde_json::to_string(&(&ctx.account, &ctx.scope)).unwrap();
     source
         .as_object_mut()
@@ -231,16 +272,30 @@ async fn events(
     let original_input;
     let body;
     if ctx.excel {
-        excel::history::restore(&scope, &mut source)
-            .map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+        if let Err(e) = excel::history::restore(&scope, &mut source) {
+            note(format!("history restore: {e}"));
+            return Err(fail(StatusCode::BAD_REQUEST, e));
+        }
         original_input =
             excel::history::input(&source).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
-        excel::attachments::upload_inputs(&client, &headers, &mut source)
-            .await
-            .map_err(|_| fail(StatusCode::BAD_GATEWAY, "attachment upload failed"))?;
-        tools = excel::tool_catalog(&source).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
-        body = excel::prepare(&source, &excel::cache_load(&scope))
-            .map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+        if let Err(_e) = excel::attachments::upload_inputs(&client, &headers, &mut source).await {
+            note("attachment upload failed".into());
+            return Err(fail(StatusCode::BAD_GATEWAY, "attachment upload failed"));
+        }
+        tools = match excel::tool_catalog(&source) {
+            Ok(tools) => tools,
+            Err(e) => {
+                note(format!("tool catalog: {e}"));
+                return Err(fail(StatusCode::BAD_REQUEST, e));
+            }
+        };
+        body = match excel::prepare(&source, &excel::cache_load(&scope)) {
+            Ok(body) => body,
+            Err(e) => {
+                note(format!("prepare: {e}"));
+                return Err(fail(StatusCode::BAD_REQUEST, e));
+            }
+        };
     } else {
         tools = BTreeMap::new();
         original_input = vec![];
@@ -252,15 +307,35 @@ async fn events(
     } else {
         "https://chatgpt.com/backend-api/codex/responses"
     };
-    let response = client
-        .post(endpoint)
-        .headers(headers)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|_| fail(StatusCode::BAD_GATEWAY, "upstream connection failed"))?;
+    let response = match client.post(endpoint).headers(headers).json(&body).send().await {
+        Ok(response) => response,
+        Err(error) => {
+            note(format!("upstream connection failed: {error}"));
+            return Err(fail(StatusCode::BAD_GATEWAY, "upstream connection failed"));
+        }
+    };
     if !response.status().is_success() {
-        return Err(fail(response.status(), "upstream rejected request"));
+        let status = response.status();
+        // 上游拒绝原因对排障关键；截断后随错误体返回给宿主重试链路。
+        let response_headers = format!("{:?}", response.headers());
+        let detail = response.text().await.unwrap_or_default();
+        eprintln!(
+            "bridge request {} upstream status {status}, headers {response_headers}",
+            ctx.request_id
+        );
+        let mut message = format!("upstream status {status}");
+        let detail = detail.trim();
+        if !detail.is_empty() {
+            let cut = detail
+                .char_indices()
+                .nth(512)
+                .map_or(detail.len(), |(i, _)| i);
+            message = format!("upstream rejected request: {}", &detail[..cut]);
+        }
+        return Err((
+            status,
+            axum::Json(json!({"error":{"type":"excel_bridge_error","message":message}})),
+        ));
     }
     let mut wire = response.bytes_stream();
     Ok(Box::pin(async_stream::stream! {
@@ -429,6 +504,12 @@ async fn control(
     }
     match operation.as_str() {
         "snapshot" => Ok(axum::Json(app.control.snapshot()).into_response()),
+        "observe" => {
+            let observation: excel::observe::ObserveEvent = serde_json::from_slice(&body)
+                .map_err(|_| fail(StatusCode::BAD_REQUEST, "invalid observation"))?;
+            app.control.observe(&observation, &app.suffix);
+            Ok((StatusCode::NO_CONTENT, axum::Json(json!({}))).into_response())
+        }
         "policy" => {
             #[derive(Deserialize)]
             #[serde(deny_unknown_fields)]
@@ -463,6 +544,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         control: Arc::new(excel::control::Control::load(policy_path.into())?),
         secret,
         config_path: std::env::var("EXCEL_BRIDGE_ACCOUNT_MAP")?,
+        suffix: std::env::var("EXCEL_BRIDGE_MODEL_SUFFIX").unwrap_or_else(|_| "-excel".into()),
     });
     let router = Router::new()
         .route("/healthz", get(|| async { StatusCode::NO_CONTENT }))
