@@ -1,0 +1,13 @@
+[Unit]
+Description=同步 CPR 账户出口代理到 Excel 桥接 account-map
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=EXCEL_BRIDGE_ACCOUNT_MAP=/opt/codex-proxy-rs/excel-companion/account-map.json
+Environment=PGHOST=127.0.0.1
+Environment=PGPORT=5432
+Environment=PGDATABASE=codex_proxy
+Environment=PGUSER=codex_proxy
+EnvironmentFile=/opt/codex-proxy-rs/excel-companion/pg.env
+ExecStart=/usr/bin/python3 /opt/codex-proxy-rs/excel-companion/sync-account-map.py

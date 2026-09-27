@@ -4,7 +4,7 @@ import { onMounted, onUnmounted, ref } from 'vue'
 
 interface Scope { allow: string[], deny: string[] }
 interface Policy { enabled: boolean, models: Scope, accounts: Scope, client_keys: Scope, concurrency: number, overflow: 'queue' | 'reject', queue_capacity: number, queue_timeout_ms: number }
-interface Row { request_id: string, model: string, client_key_id: string | null, account_id: string | null, status: string, started_at_ms: number, queue_ms: number | null, finished_at_ms: number | null, usage: { input_tokens?: number, output_tokens?: number, cost?: unknown } | null }
+interface Row { request_id: string, model: string, client_key_id: string | null, account_id: string | null, status: string, started_at_ms: number, queue_ms: number | null, finished_at_ms: number | null, usage: { input_tokens?: number, output_tokens?: number, cost?: unknown } | null, error: string | null, error_code: string | null, upstream_model: string | null, source: string }
 interface Snapshot { policy: Policy, version: number | null, active: number, waiting: number, records: Row[] }
 const snapshot = ref<Snapshot | null>(null)
 const policy = ref<Policy | null>(null)
@@ -80,7 +80,7 @@ async function save() {
   finally { saving.value = false }
 }
 function rows() {
-  return snapshot.value?.records.filter(row => !filter.value || `${row.model} ${row.request_id} ${row.status} ${row.client_key_id ?? ''}`.includes(filter.value)) ?? []
+  return snapshot.value?.records.filter(row => !filter.value || `${row.model} ${row.request_id} ${row.status} ${row.client_key_id ?? ''} ${row.error ?? ''} ${row.error_code ?? ''} ${row.upstream_model ?? ''}`.includes(filter.value)) ?? []
 }
 onMounted(() => {
   void refresh(true)
@@ -121,14 +121,20 @@ onUnmounted(() => {
       </div>
       <div class="table-scroll">
         <table>
-          <thead><tr><th>时间</th><th>模型 / 请求</th><th>状态</th><th>账户 / Key</th><th>排队</th><th>耗时</th><th>输入 / 输出 tokens</th></tr></thead>
+          <thead><tr><th>时间</th><th>模型 / 请求</th><th>状态</th><th>账户 / Key</th><th>排队</th><th>耗时</th><th>输入 / 输出 tokens</th><th>上游模型</th><th>错误</th></tr></thead>
           <tbody>
             <tr v-for="row in rows()" :key="row.request_id">
-              <td>{{ new Date(row.started_at_ms).toLocaleTimeString() }}</td><td>{{ row.model }}<small>{{ row.request_id }}</small></td><td>{{ row.status }}</td>
-              <td>{{ row.account_id ?? '—' }}<small>{{ row.client_key_id ?? '—' }}</small></td><td>{{ row.queue_ms ?? '—' }} ms</td>
-              <td>{{ row.finished_at_ms == null ? '—' : row.finished_at_ms - row.started_at_ms }} ms</td><td>{{ row.usage?.input_tokens ?? '—' }} / {{ row.usage?.output_tokens ?? '—' }}</td>
+              <td>{{ new Date(row.started_at_ms).toLocaleTimeString() }}</td>
+              <td>{{ row.model }}<small>{{ row.request_id }}</small></td>
+              <td>{{ row.status }}<small v-if="row.source === 'host'">宿主观察</small></td>
+              <td>{{ row.account_id ?? '—' }}<small>{{ row.client_key_id ?? '—' }}</small></td>
+              <td>{{ row.queue_ms ?? '—' }} ms</td>
+              <td>{{ row.finished_at_ms == null ? '—' : row.finished_at_ms - row.started_at_ms }} ms</td>
+              <td>{{ row.usage?.input_tokens ?? '—' }} / {{ row.usage?.output_tokens ?? '—' }}</td>
+              <td>{{ row.upstream_model ?? '—' }}</td>
+              <td class="error-cell">{{ row.error || row.error_code || '—' }}</td>
             </tr><tr v-if="rows().length === 0">
-              <td colspan="7" class="empty">
+              <td colspan="9" class="empty">
                 暂无匹配的 Excel 请求
               </td>
             </tr>
@@ -270,6 +276,11 @@ th {
 }
 .error {
   color: var(--cp-color-error, #b42318);
+}
+.error-cell {
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 @media (max-width: 700px) {
   .scope {

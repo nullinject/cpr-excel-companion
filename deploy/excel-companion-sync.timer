@@ -1,0 +1,9 @@
+[Unit]
+Description=定期同步 CPR 账户出口代理到 Excel 桥接
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target

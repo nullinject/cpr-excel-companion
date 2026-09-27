@@ -30,6 +30,13 @@ struct Record {
     queue_ms: Option<u64>,
     finished_at_ms: Option<u64>,
     usage: Option<Value>,
+    /// 桥接流内产生的错误说明；观察合并时保留首条。
+    error: Option<String>,
+    /// 宿主观察到的上游模型与终态错误码。
+    upstream_model: Option<String>,
+    error_code: Option<String>,
+    /// 记录来源：bridge=桥接自查，host=仅宿主观察（请求未到桥接已失败等）。
+    source: &'static str,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -151,6 +158,10 @@ impl Control {
                 queue_ms: None,
                 finished_at_ms: None,
                 usage: None,
+                error: None,
+                upstream_model: None,
+                error_code: None,
+                source: "bridge",
             });
             while i.records.len() > 1000 {
                 i.records.pop_back();
@@ -182,6 +193,87 @@ impl Control {
             f(row)
         }
     }
+    /// 合并宿主最终观察：真实 Key 身份、上游模型、终态与错误码。
+    /// 观察有界且不重投；未知请求只接受带 -excel 后缀的模型（宿主侧已失败、未到桥接）。
+    pub fn observe(&self, observation: &crate::observe::ObserveEvent, suffix: &str) {
+        let excel_requested = observation
+            .requested_model
+            .as_deref()
+            .is_some_and(|m| m.ends_with(suffix) && m != suffix);
+        let mut i = self.lock();
+        if let Some(row) = i
+            .records
+            .iter_mut()
+            .find(|r| r.request_id == observation.request_id)
+        {
+            row.client_key_id = observation
+                .client_key_id
+                .clone()
+                .unwrap_or_else(|| row.client_key_id.clone());
+            if let Some(account) = &observation.account_id {
+                row.account_id = account.clone();
+            }
+            row.upstream_model = observation.upstream_model.clone();
+            if let Some(usage) = &observation.usage {
+                row.usage = serde_json::to_value(usage).ok();
+            }
+            if let Some(terminal) = &observation.terminal {
+                row.status = format!("{:?}", terminal.outcome).to_lowercase();
+                row.error_code = terminal.error_code.clone();
+            }
+            if let Some(failure) = &observation.failure {
+                if failure.error_code.is_some() {
+                    row.error_code = failure.error_code.clone();
+                }
+                if let Some(status) = failure.upstream_status_code {
+                    row.error = Some(format!("upstream status {status}"));
+                }
+            }
+            row.finished_at_ms = Some(observation.completed_at_ms);
+            return;
+        }
+        if !excel_requested || !i.saved.policy.enabled {
+            return;
+        }
+        let status = observation
+            .terminal
+            .as_ref()
+            .map(|t| format!("{:?}", t.outcome).to_lowercase())
+            .unwrap_or_else(|| "unknown".into());
+        i.records.push_front(Record {
+            request_id: observation.request_id.clone(),
+            model: observation.requested_model.clone().unwrap_or_default(),
+            client_key_id: observation.client_key_id.clone().unwrap_or_default(),
+            account_id: observation.account_id.clone().unwrap_or_default(),
+            status,
+            started_at_ms: observation.completed_at_ms,
+            queue_ms: None,
+            finished_at_ms: Some(observation.completed_at_ms),
+            usage: observation
+                .usage
+                .as_ref()
+                .and_then(|u| serde_json::to_value(u).ok()),
+            error: observation
+                .failure
+                .as_ref()
+                .and_then(|f| f.upstream_status_code.map(|s| format!("upstream status {s}"))),
+            upstream_model: observation.upstream_model.clone(),
+            error_code: observation
+                .terminal
+                .as_ref()
+                .and_then(|t| t.error_code.clone())
+                .or_else(|| {
+                    observation
+                        .failure
+                        .as_ref()
+                        .and_then(|f| f.error_code.clone())
+                }),
+            source: "host",
+        });
+        while i.records.len() > 1000 {
+            i.records.pop_back();
+        }
+    }
 }
 pub struct Lease {
     control: Arc<Control>,
@@ -201,6 +293,14 @@ impl Lease {
     }
     pub fn failed(&self) {
         self.control.update(&self.id, |r| {
+            r.status = "failed".into();
+            r.finished_at_ms = Some(now());
+        })
+    }
+    /// 记录桥接侧失败原因；观察合并保留宿主终态，不覆盖已写的 error。
+    pub fn fail(&self, message: &str) {
+        self.control.update(&self.id, |r| {
+            r.error = Some(message.to_owned());
             r.status = "failed".into();
             r.finished_at_ms = Some(now());
         })
