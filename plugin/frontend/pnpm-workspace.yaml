@@ -1,0 +1,6 @@
+autoInstallPeers: false
+
+# Git 依赖按锁文件固定源码，由自有 UI 仓库的 prepack 生成产物。
+allowBuilds:
+  '@codex-proxy/ui@git+https://github.com/zyycn/codex-proxy-ui.git': true
+  '@codex-proxy/ui@https://codeload.github.com/zyycn/codex-proxy-ui/tar.gz/fe4373db3239e81b56cb448c46f3cd395799c4f7': set this to true or false

@@ -1,0 +1,10 @@
+/target/
+/dist/
+/private/
+**/node_modules/
+/plugin/frontend/dist/
+*.tsbuildinfo
+.env
+.env.*
+*.local.json
+.DS_Store

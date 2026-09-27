@@ -1,0 +1,68 @@
+{
+  "manifestVersion": 1,
+  "name": "excel-companion",
+  "publisher": "nullinject",
+  "displayName": "Excel Companion",
+  "version": "0.1.1",
+  "description": "官方 CPR 的 Excel 桥接适配器（联调版本）",
+  "license": "Unlicense",
+  "engines": {
+    "codex-proxy-rs": ">=3.16.0, <3.17.0"
+  },
+  "main": "bin/cpr-excel-companion-plugin",
+  "runtime": "trustedProcess",
+  "contributes": {
+    "middleware": {
+      "stages": [
+        "attempt"
+      ],
+      "inputFormats": [
+        "openai"
+      ],
+      "outputFormats": [
+        "openai"
+      ]
+    },
+    "management": {}
+  },
+  "permissions": [
+    "requests",
+    "network",
+    "data"
+  ],
+  "configurationSchema": {
+    "type": "object",
+    "properties": {
+      "secretFile": {
+        "type": "string",
+        "default": "/run/secrets/excel-bridge.key"
+      },
+      "isolationScope": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256
+      },
+      "excelEnabled": {
+        "type": "boolean",
+        "default": false
+      },
+      "bridgeControlUrl": {
+        "type": "string",
+        "default": "https://example.invalid/excel-companion/_control"
+      },
+      "showPage": {
+        "type": "boolean",
+        "default": true
+      }
+    },
+    "required": [
+      "isolationScope"
+    ],
+    "additionalProperties": false
+  },
+  "resources": {
+    "web/index.html": "text/html",
+    "web/app.js": "text/javascript",
+    "web/app.css": "text/css"
+  }
+}

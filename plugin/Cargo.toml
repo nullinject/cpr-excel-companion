@@ -1,0 +1,14 @@
+[package]
+name = "cpr-excel-companion-plugin"
+version = "0.1.1"
+edition = "2024"
+license = "Unlicense"
+publish = false
+[dependencies]
+cpr-excel-companion = { path = ".." }
+gateway-plugin-sdk = { path = "../vendor/gateway-plugin-sdk", features = ["io"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt", "io-std"] }
+
+sha2 = "0.10"
+hex = "0.4"

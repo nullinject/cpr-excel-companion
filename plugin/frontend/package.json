@@ -1,0 +1,35 @@
+{
+  "name": "cpr-excel-gateway-ui",
+  "type": "module",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@12.6.0",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "vue-tsc -b && vite build",
+    "dev": "vite --host 127.0.0.1",
+    "lint": "eslint .",
+    "typecheck": "vue-tsc -b --pretty false"
+  },
+  "dependencies": {
+    "@codex-proxy/ui": "github:zyycn/codex-proxy-ui#v0.3.0",
+    "@lucide/vue": "^1.47.0",
+    "vue": "^3.5.42"
+  },
+  "devDependencies": {
+    "@antfu/eslint-config": "^9.5.1",
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/node": "^26.5.1",
+    "@vitejs/plugin-vue": "^6.0.8",
+    "@vue/tsconfig": "^0.9.1",
+    "eslint": "^10.10.0",
+    "eslint-plugin-format": "^2.0.1",
+    "eslint-plugin-vuejs-accessibility": "^2.6.0",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^6.0.3",
+    "vite": "^8.3.0",
+    "vue-tsc": "^3.3.11"
+  }
+}
