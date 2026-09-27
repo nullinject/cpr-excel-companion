@@ -193,6 +193,53 @@ impl Control {
             f(row)
         }
     }
+    /// 未签名透传请求的记录句柄；不占用 Excel 准入预算。
+    pub fn enter_unsigned(
+        self: &Arc<Self>,
+        request_id: &str,
+        model: &str,
+        account_id: Option<&str>,
+    ) -> Result<UnsignedLease, &'static str> {
+        let mut i = self.lock();
+        i.records.push_front(Record {
+            request_id: request_id.to_owned(),
+            model: model.to_owned(),
+            client_key_id: "unsigned".into(),
+            account_id: account_id.unwrap_or("unknown").to_owned(),
+            status: "running".into(),
+            started_at_ms: now(),
+            queue_ms: None,
+            finished_at_ms: None,
+            usage: None,
+            error: None,
+            upstream_model: None,
+            error_code: None,
+            source: "unsigned",
+        });
+        while i.records.len() > 1000 {
+            i.records.pop_back();
+        }
+        Ok(UnsignedLease {
+            control: self.clone(),
+            id: request_id.to_owned(),
+        })
+    }
+    pub fn running(&self, request_id: &str, queue_ms: u64) {
+        self.update(request_id, |r| {
+            r.status = "running".into();
+            r.queue_ms = Some(queue_ms);
+        });
+    }
+    pub fn finish_unsigned(&self, request_id: &str, event: &Value) {
+        self.update(request_id, |r| {
+            r.status = event["response"]["status"]
+                .as_str()
+                .unwrap_or("failed")
+                .into();
+            r.usage = event["response"].get("usage").cloned();
+            r.finished_at_ms = Some(now());
+        });
+    }
     /// 合并宿主最终观察：真实 Key 身份、上游模型、终态与错误码。
     /// 观察有界且不重投；未知请求只接受带 -excel 后缀的模型（宿主侧已失败、未到桥接）。
     pub fn observe(&self, observation: &crate::observe::ObserveEvent, suffix: &str) {
@@ -298,6 +345,19 @@ impl Lease {
         })
     }
     /// 记录桥接侧失败原因；观察合并保留宿主终态，不覆盖已写的 error。
+    pub fn fail(&self, message: &str) {
+        self.control.update(&self.id, |r| {
+            r.error = Some(message.to_owned());
+            r.status = "failed".into();
+            r.finished_at_ms = Some(now());
+        })
+    }
+}
+pub struct UnsignedLease {
+    control: Arc<Control>,
+    id: String,
+}
+impl UnsignedLease {
     pub fn fail(&self, message: &str) {
         self.control.update(&self.id, |r| {
             r.error = Some(message.to_owned());

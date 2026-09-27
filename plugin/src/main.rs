@@ -36,6 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("isolationScope is required")?
         .to_owned();
     let enabled = config["excelEnabled"].as_bool().unwrap_or(true);
+    let mode = config["excelMode"].as_str().unwrap_or("suffix").to_owned();
     let suffix = config["excelModelSuffix"]
         .as_str()
         .unwrap_or("-excel")
@@ -52,6 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .middleware(move |mut call| {
             let secret = secret.clone();
             let scope = scope.clone();
+            let mode = mode.clone();
             let suffix = suffix.clone();
             async move {
                 if call.request.head.provider.as_deref() != Some("openai") {
@@ -75,9 +77,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .and_then(Value::as_str)
                     .or(call.request.head.model.as_deref())
                     .unwrap_or("");
-                let excel = enabled
-                    && requested.ends_with(suffix.as_str())
-                    && requested.len() > suffix.len();
+                // 绑定（clientKeyIds × models）由宿主匹配后才会调用本插件；
+                // excelMode 决定命中的请求如何签名：suffix=按后缀，always/never=固定。
+                let excel = match mode.as_str() {
+                    "always" => true,
+                    "never" => false,
+                    _ => {
+                        enabled
+                            && requested.ends_with(suffix.as_str())
+                            && requested.len() > suffix.len()
+                    }
+                };
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
