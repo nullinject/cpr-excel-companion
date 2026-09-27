@@ -9,6 +9,7 @@ interface Policy {
   accounts: Scope
   client_keys: Scope
   model_channels: Record<string, 'excel' | 'native'>
+  key_rules: Record<string, { models: Record<string, 'excel' | 'native'> }>
   concurrency: number
   overflow: 'queue' | 'reject'
   queue_capacity: number
@@ -41,8 +42,10 @@ const saving = ref(false)
 const tab = ref<'monitor' | 'settings'>('monitor')
 const filter = ref('')
 const options = ref<{ accounts: { account_id: string, enabled: boolean }[], keys: { id: string, name: string, enabled: boolean }[] }>({ accounts: [], keys: [] })
-const pluginInfo = ref<{ excelEnabled: boolean, excelMode: string, excelModelSuffix: string, isolationScope: string } | null>(null)
-const newModel = ref('')
+const pluginInfo = ref<{ excelMode?: string, excelModelSuffix?: string, excelEnabled?: boolean, isolationScope: string } | null>(null)
+// Excel 通道预制模型（原项目固定四款），无需手动添加
+const PRESET_MODELS = ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-6-astra'] as const
+const channelFilter = ref<'all' | 'excel' | 'native' | 'unsigned'>('all')
 
 const keyNames = computed(() => {
   const map = new Map<string, string>()
@@ -70,8 +73,9 @@ function setModelState(model: string, state: 'suffix' | 'excel' | 'native') {
   else
     p.model_channels[model] = state
 }
+
 const knownModels = computed(() => {
-  const set = new Set<string>()
+  const set = new Set<string>(PRESET_MODELS)
   for (const row of snapshot.value?.records ?? []) {
     if (row.model)
       set.add(baseName(row.model))
@@ -172,8 +176,14 @@ const learnedKeys = computed(() => {
   }
   return [...counts.entries()].map(([id, c]) => ({ id, name: keyNames.value.get(id) ?? id.slice(0, 14) + '…', ...c })).sort((a, b) => b.excel + b.native - (a.excel + a.native))
 })
+function rowChannel(row: Row): 'excel' | 'native' | 'unsigned' {
+  if (row.source === 'unsigned') return 'unsigned'
+  return row.excel ? 'excel' : 'native'
+}
 function rows() {
   return snapshot.value?.records.filter((row) => {
+    if (channelFilter.value !== 'all' && rowChannel(row) !== channelFilter.value)
+      return false
     if (!filter.value) return true
     const key = keyLabel(row.client_key_id)
     return `${row.model} ${row.request_id} ${row.status} ${key} ${row.error ?? ''} ${row.error_code ?? ''}`.includes(filter.value)
@@ -195,9 +205,8 @@ function statusText(row: Row): string {
   return map[row.status] ?? row.status
 }
 function channelText(row: Row): string {
-  if (row.source === 'unsigned') return '原生透传'
-  if (row.source === 'host') return '仅观察'
-  return row.excel ? 'Excel' : '原生'
+  const c = rowChannel(row)
+  return c === 'excel' ? 'Excel' : c === 'unsigned' ? '未签名透传' : '原生'
 }
 async function save() {
   saving.value = true
@@ -273,6 +282,12 @@ onUnmounted(() => {
       <BaseCard>
         <div class="toolbar">
           <label for="filter">筛选 <input id="filter" v-model="filter" placeholder="Key、模型、状态或错误"></label>
+          <span class="seg">
+            <button type="button" class="seg-btn" :class="{ active: channelFilter === 'all' }" @click="channelFilter = 'all'">全部</button>
+            <button type="button" class="seg-btn" :class="{ active: channelFilter === 'excel' }" @click="channelFilter = 'excel'">Excel</button>
+            <button type="button" class="seg-btn" :class="{ active: channelFilter === 'native' }" @click="channelFilter = 'native'">原生</button>
+            <button type="button" class="seg-btn" :class="{ active: channelFilter === 'unsigned' }" @click="channelFilter = 'unsigned'">未签名</button>
+          </span>
           <small>最近 1000 条 · 进程重启后清空</small>
         </div>
         <div class="table-scroll">
@@ -328,8 +343,8 @@ onUnmounted(() => {
 
       <BaseCard>
         <div class="card-title">
-          模型通道（按基础模型名）
-          <small>跟随后缀 = 客户端用带 -excel 的名字走 Excel；Excel = 无后缀也强制走 Excel；原生 = 带 -excel 后缀也压回原生。对签名与未签名请求都生效。</small>
+          全局模型通道（所有 Key 的默认）
+          <small>上面的按 Key 规则优先于此处；两者都没设置时跟随后缀。Excel = 无后缀也强制走 Excel；原生 = 带 -excel 后缀也压回原生。</small>
         </div>
         <div class="chips">
           <div v-for="model in knownModels" :key="model" class="chip model" :class="'state-' + modelState(model)">
@@ -341,12 +356,6 @@ onUnmounted(() => {
             </span>
           </div>
           <span v-if="knownModels.length === 0" class="muted">暂无已知模型，发起请求后出现在这里</span>
-        </div>
-        <div class="grid">
-          <label>添加模型 <input v-model="newModel" placeholder="模型名，如 gpt-5.6-sol"></label>
-          <button type="button" class="add-btn" @click="if (newModel.trim()) { setModelState(newModel.trim(), 'excel'); newModel = '' }">
-            添加并强制 Excel
-          </button>
         </div>
       </BaseCard>
 
@@ -369,20 +378,20 @@ onUnmounted(() => {
         <div class="card-title">
           插件设置（在 CPR 插件实例编辑器中修改）
           <small v-if="pluginInfo">
-            excelMode={{ pluginInfo.excelMode }} · 模型后缀={{ pluginInfo.excelModelSuffix }} · 总开关={{ pluginInfo.excelEnabled ? '开' : '关' }} · 作用域={{ pluginInfo.isolationScope }}
+            作用域={{ pluginInfo.isolationScope }} · Excel 后缀已内置（-excel） · 通道开关在本页配置
           </small>
         </div>
       </BaseCard>
 
       <BaseCard>
         <div class="card-title">
-          按 Key 授权（学到的使用情况）
-          <small>哪些 Key 能使用 Excel 通道由 CPR 插件实例的「绑定」决定：绑定 clientKeyIds 后命中的请求可走 Excel，未绑定自动原生透传。下表是最近请求里实际出现过的 Key。</small>
+          按 Key 使用情况
+          <small>各 Key 最近实际走向。按 Key 授权的两条原生路径：① CPR 插件实例「绑定」的 clientKeyIds（勾选的 Key 可进 Excel 通道，未勾选一律原生透传）；② CPR 原生 Key 模型授权（为 Key 勾选 ±excel 变体即锁定通道）。宿主对插件隐藏 key 身份，此处为只读统计。</small>
         </div>
         <div class="chips">
           <div v-for="key in learnedKeys" :key="key.id" class="chip">
             <span class="chip-name">{{ key.name }}</span>
-            <span class="chip-state">Excel {{ key.excel }} 次 · 原生 {{ key.native }} 次</span>
+            <span class="chip-state">Excel {{ key.excel }} · 原生 {{ key.native }}</span>
           </div>
           <span v-if="learnedKeys.length === 0" class="muted">暂无数据</span>
         </div>
