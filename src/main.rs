@@ -226,7 +226,38 @@ fn upstream_headers(incoming: &HeaderMap, is_excel: bool) -> Result<HeaderMap, F
     }
     Ok(headers)
 }
-async fn events(
+// Once streaming starts, report a failed terminal instead of an unexplained EOF.
+fn terminal_errors(mut stream: Events) -> Events {
+    Box::pin(async_stream::stream! {
+        let mut response_id = "resp_excel_failed".to_owned();
+        let mut sequence = 0_u64;
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(event) => {
+                    if let Some(id) = event.pointer("/response/id").and_then(Value::as_str) {
+                        response_id = id.to_owned();
+                    }
+                    if let Some(number) = event["sequence_number"].as_u64() {
+                        sequence = number.saturating_add(1);
+                    }
+                    yield Ok(event);
+                }
+                Err(error) => {
+                    // Stream errors are static bridge diagnostics, never upstream payloads.
+                    yield Ok(json!({"type":"response.failed","sequence_number":sequence,
+                        "response":{"id":response_id,"object":"response","status":"failed",
+                        "output":[],"error":{"type":"server_error","code":"excel_bridge_stream_error","message":error}}}));
+                    return;
+                }
+            }
+        }
+    })
+}
+async fn events(app: Arc<App>, identity: Identity, headers: HeaderMap, source: Value) -> Result<Events, Failure> {
+    open_events(app, identity, headers, source).await.map(terminal_errors)
+}
+
+async fn open_events(
     app: Arc<App>,
     identity: Identity,
     headers: HeaderMap,
@@ -277,12 +308,7 @@ async fn events(
         .and_then(Value::as_str)
         .ok_or_else(|| fail(StatusCode::BAD_REQUEST, "model is required"))?
         .to_owned();
-    // CPR 的 generate=false 探针/预热：Excel 不支持，走原生透传。
-    let prewarm = source.get("generate") == Some(&Value::Bool(false));
-    let lease = app
-        .control
-        .enter(&ctx, &model, &app.suffix, prewarm)
-        .await;
+    let lease = app.control.enter(&ctx, &model, &app.suffix).await;
     if lease.rejected {
         return Err(fail(
             StatusCode::TOO_MANY_REQUESTS,
@@ -295,6 +321,19 @@ async fn events(
         lease.fail(&message);
         eprintln!("bridge request {} failed: {message}", ctx.request_id);
     };
+    let scope = serde_json::to_string(&(&ctx.account, &ctx.scope)).unwrap();
+    if ctx.excel && source.get("generate") == Some(&Value::Bool(false)) {
+        let warmup = excel::history::prewarm(&scope, &source).map_err(|error| {
+            lease.fail(error);
+            fail(StatusCode::BAD_REQUEST, error)
+        })?;
+        if let Some(terminal) = warmup.last() {
+            lease.terminal(terminal);
+        }
+        return Ok(Box::pin(futures_util::stream::iter(
+            warmup.into_iter().map(Ok),
+        )));
+    }
     let client = match client(&app, &ctx) {
         Ok(client) => client,
         Err((status, error)) => {
@@ -313,7 +352,6 @@ async fn events(
             return Err((status, error));
         }
     };
-    let scope = serde_json::to_string(&(&ctx.account, &ctx.scope)).unwrap();
     source
         .as_object_mut()
         .ok_or_else(|| fail(StatusCode::BAD_REQUEST, "request must be an object"))?
@@ -399,17 +437,17 @@ async fn events(
         loop {
             let chunk = match tokio::time::timeout(Duration::from_secs(15), wire.next()).await {
                 Ok(Some(Ok(c))) => c,
-                Ok(Some(Err(_))) => { yield Err("upstream stream interrupted"); return; }
+                Ok(Some(Err(_))) => { lease.fail("upstream stream interrupted"); yield Err("upstream stream interrupted"); return; }
                 Ok(None) => break,
                 Err(_elapsed) => {
                     yield Ok(json!({"type":"bridge.comment","text":"keepalive"}));
                     continue;
                 }
             };
-            let input = match decoder.push(&chunk) { Ok(v) => v, Err(e) => { yield Err(e); return; } };
+            let input = match decoder.push(&chunk) { Ok(v) => v, Err(e) => { lease.fail(e); eprintln!("bridge stream {} failed: {e}", ctx.request_id); yield Err(e); return; } };
             for event in input {
                 let output = if ctx.excel { translator.event(event) } else { Ok(vec![event]) };
-                let output = match output { Ok(v) => v, Err(e) => { yield Err(e); return; } };
+                let output = match output { Ok(v) => v, Err(e) => { lease.fail(e); eprintln!("bridge stream {} failed: {e}", ctx.request_id); yield Err(e); return; } };
                 for event in output {
                     terminal = matches!(event["type"].as_str(), Some("response.completed"|"response.failed"|"response.incomplete"));
                     if terminal { lease.terminal(&event); }
@@ -740,4 +778,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod terminal_error_tests {
+    use super::*;
+    #[tokio::test]
+    async fn partial_response_gets_failed_terminal_without_success_or_payload_leak() {
+        let events: Events = Box::pin(futures_util::stream::iter(vec![
+            Ok(json!({"type":"response.created","sequence_number":3,"response":{"id":"resp_test"}})),
+            Err("invalid tool transport envelope"),
+        ]));
+        let output: Vec<_> = terminal_errors(events).collect().await;
+        assert_eq!(output.len(), 2);
+        let terminal = output[1].as_ref().unwrap();
+        assert_eq!(terminal["type"], "response.failed");
+        assert_eq!(terminal["sequence_number"], 4);
+        assert_eq!(terminal["response"]["id"], "resp_test");
+        assert_eq!(terminal["response"]["error"]["message"], "invalid tool transport envelope");
+    }
 }

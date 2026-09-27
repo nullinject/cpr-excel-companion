@@ -189,7 +189,7 @@ pub fn prepare(source: &Value, original_calls: &BTreeMap<String, Value>) -> Resu
         "This is an external Responses client, not a live Excel workbook. Answer in text; do not invoke workbook tools.".to_owned()
     } else {
         format!(
-            "This is an external Responses client. Native run_officejs is an intercepted transport, not an OfficeJS executor. For each client tool, call run_officejs with summary, extended_summary, destructive=false, references=[], and code containing one JSON string: {{\"name\":\"CATALOG_NAME\",\"arguments\":{{}}}} for function tools, or {{\"name\":\"CATALOG_NAME\",\"input\":\"RAW_TEXT\"}} for custom tools. Do not execute OfficeJS or invoke other native tools. Preserve names and schemas exactly. {} Catalog: {}",
+            "This is an external Responses client. Native run_officejs is an intercepted transport, not an OfficeJS executor. For each client tool, call run_officejs with summary, extended_summary, destructive=false, references=[], and code containing one JSON string: {{\"name\":\"CATALOG_NAME\",\"arguments\":{{}}}} for function tools, or {{\"name\":\"CATALOG_NAME\",\"input\":\"RAW_TEXT\"}} for custom tools. Do not execute OfficeJS or invoke other native tools. Serialize the complete inner JSON object, including backslashes and quotes. Do not nest another run_officejs wrapper. Preserve names and schemas exactly. {} Catalog: {}",
             if source["parallel_tool_calls"] == false {
                 "Make only one tool call per response."
             } else {
@@ -249,6 +249,8 @@ pub fn prepare(source: &Value, original_calls: &BTreeMap<String, Value>) -> Resu
     Ok(result)
 }
 
+mod tool_envelope;
+
 pub fn restore_call(native: &Value, tools: &Tools) -> Result<Value> {
     if !matches!(
         native["name"].as_str(),
@@ -262,9 +264,7 @@ pub fn restore_call(native: &Value, tools: &Tools) -> Result<Value> {
             .ok_or("missing native arguments")?,
     )
     .map_err(|_| "invalid native arguments")?;
-    let envelope: Value =
-        serde_json::from_str(args["code"].as_str().ok_or("missing tool transport code")?)
-            .map_err(|_| "invalid tool transport envelope")?;
+    let envelope = tool_envelope::decode(&args["code"])?;
     let tool = tools
         .get(
             envelope["name"]

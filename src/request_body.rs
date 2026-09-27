@@ -156,10 +156,17 @@ mod tests {
         };
         let secret = vec![7; 48];
         let absent = std::env::temp_dir().join(format!("excel-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&absent).unwrap();
+        let control = Arc::new(excel::control::Control::load(absent.join("policy.json")).unwrap());
+        let policy = excel::admission::Policy {
+            enabled: true,
+            ..Default::default()
+        };
+        control.save(policy, Some(0)).unwrap();
         let app = Arc::new(App {
             secret: secret.clone(),
             config_path: absent.join("accounts.json").to_string_lossy().into_owned(),
-            control: Arc::new(excel::control::Control::load(absent.join("policy.json")).unwrap()),
+            control,
             suffix: "-excel".into(),
             allow_unsigned: true,
         });
@@ -182,11 +189,11 @@ mod tests {
             let mut headers = HeaderMap::new();
             if let Some(excel) = mode {
                 let ctx = Context {
+                    key: None,
                     account: "test".into(),
                     scope: "test".into(),
                     request_id: uuid::Uuid::new_v4().to_string(),
                     excel,
-                    key: None,
                     expires: SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .unwrap()
@@ -211,7 +218,7 @@ mod tests {
             let encoded = zstd::stream::encode_all(body.as_slice(), 3).unwrap();
             let compressed = client
                 .post(&url)
-                .headers(headers)
+                .headers(headers.clone())
                 .body(encoded)
                 .send()
                 .await
@@ -224,7 +231,32 @@ mod tests {
             );
             assert_eq!(compressed.status(), status);
             assert_eq!(compressed.json::<Value>().await.unwrap(), expected);
+            if mode == Some(true) {
+                source["generate"] = serde_json::json!(false);
+                let warmup =
+                    zstd::stream::encode_all(serde_json::to_vec(&source).unwrap().as_slice(), 3)
+                        .unwrap();
+                let response = client
+                    .post(&url)
+                    .headers(headers)
+                    .body(warmup)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let wire = response.text().await.unwrap();
+                let terminal: Value = wire
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                    .find(|event| event["type"] == "response.completed")
+                    .unwrap();
+                assert_eq!(terminal["response"]["usage"]["total_tokens"], 0);
+                assert_eq!(terminal["response"]["output"], serde_json::json!([]));
+            }
         }
         server.abort();
+        std::fs::remove_file(absent.join("policy.json")).unwrap();
+        std::fs::remove_dir(absent).unwrap();
     }
 }

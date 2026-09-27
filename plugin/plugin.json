@@ -3,7 +3,7 @@
   "name": "excel-companion",
   "publisher": "nullinject",
   "displayName": "Excel Companion",
-  "version": "0.8.0",
+  "version": "0.8.2",
   "description": "官方 CPR 的 Excel 桥接适配器（数据面桥接 + 进程内控制面）",
   "license": "Unlicense",
   "engines": {
@@ -14,7 +14,6 @@
   "contributes": {
     "middleware": {
       "stages": [
-        "request",
         "attempt"
       ],
       "inputFormats": [

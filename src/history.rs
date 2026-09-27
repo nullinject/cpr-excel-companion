@@ -50,6 +50,42 @@ pub fn restore(scope: &str, source: &mut Value) -> Result<()> {
     Ok(())
 }
 
+/// A Codex connection prewarm reserves replay history without contacting Excel.
+pub fn prewarm(scope: &str, source: &Value) -> Result<Vec<Value>> {
+    if source.get("generate") != Some(&Value::Bool(false)) {
+        return Err("prewarm requires generate=false");
+    }
+    let mut source = source.clone();
+    source
+        .as_object_mut()
+        .ok_or("invalid request")?
+        .remove("generate");
+    restore(scope, &mut source)?;
+    let input = input(&source)?;
+    if serde_json::to_vec(&input).map_or(true, |b| b.len() > 2 * 1024 * 1024) {
+        return Err("Excel prewarm history exceeds 2 MiB");
+    }
+    let model = source["model"].as_str().ok_or("model is required")?;
+    let response = json!({
+        "id": format!("resp_{}", uuid::Uuid::new_v4().simple()),
+        "object": "response",
+        "created_at": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+        "status": "completed", "model": model.strip_suffix("-excel").unwrap_or(model),
+        "output": [], "error": null, "incomplete_details": null,
+        "usage": {"input_tokens":0,"output_tokens":0,"total_tokens":0,
+            "input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}
+    });
+    save(scope, &input, &response);
+    let mut started = response.clone();
+    started["status"] = json!("in_progress");
+    started["usage"] = Value::Null;
+    Ok(vec![
+        json!({"type":"response.created","sequence_number":0,"response":started}),
+        json!({"type":"response.in_progress","sequence_number":1,"response":started}),
+        json!({"type":"response.completed","sequence_number":2,"response":response}),
+    ])
+}
+
 pub fn save(scope: &str, input: &[Value], response: &Value) {
     if response["status"] != "completed" {
         return;
@@ -93,6 +129,21 @@ mod tests {
         restore("account/key-a", &mut next).unwrap();
         assert_eq!(next["input"].as_array().unwrap().len(), 3);
         assert!(next.get("previous_response_id").is_none());
+    }
+    #[test]
+    fn prewarm_has_zero_usage_and_replayable_input() {
+        let source = json!({"model":"gpt-6-sol","generate":false,"input":"remember marker"});
+        let events = prewarm("prewarm-test/account-key", &source).unwrap();
+        assert_eq!(events.len(), 3);
+        let response = &events[2]["response"];
+        assert_eq!(response["usage"]["total_tokens"], 0);
+        assert_eq!(response["output"], json!([]));
+        let mut next = json!({"previous_response_id":response["id"],"input":"repeat marker"});
+        assert!(restore("prewarm-test/other-key", &mut next).is_err());
+        restore("prewarm-test/account-key", &mut next).unwrap();
+        assert_eq!(next["input"].as_array().unwrap().len(), 2);
+        assert_eq!(source["generate"], false);
+        assert!(prewarm("a", &json!({"generate":true,"input":[]})).is_err());
     }
     #[test]
     fn prewarm_never_becomes_a_billable_generation() {

@@ -194,6 +194,16 @@ mod tests {
     }
 
     #[test]
+    fn official_316_manifest_avoids_request_websocket_framing_bug() {
+        let value: serde_json::Value =
+            serde_json::from_slice(include_bytes!("../plugin.json")).unwrap();
+        assert_eq!(
+            value["contributes"]["middleware"]["stages"],
+            serde_json::json!(["attempt"])
+        );
+    }
+
+    #[test]
     fn author_manifest_is_accepted_by_pinned_official_sdk() {
         let manifest =
             gateway_plugin_sdk::Manifest::from_author_slice(include_bytes!("../plugin.json"))
