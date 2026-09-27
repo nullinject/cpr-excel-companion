@@ -150,15 +150,21 @@ impl Control {
         ctx: &Context,
         model: &str,
         suffix: &str,
+        prewarm: bool,
     ) -> Lease {
         let base = model.strip_suffix(suffix).filter(|b| !b.is_empty()).unwrap_or(model);
         let (excel, gate, guard) = {
             let mut i = self.lock();
             let channel = i.saved.policy.model_channels.get(base).copied();
-            let desired = match channel {
-                Some(crate::admission::Channel::Excel) => true,
-                Some(crate::admission::Channel::Native) => false,
-                None => ctx.excel,
+            // CPR 探针/预热（generate=false）不进 Excel 通道：Excel 无法预热，转原生。
+            let desired = if prewarm {
+                false
+            } else {
+                match channel {
+                    Some(crate::admission::Channel::Excel) => true,
+                    Some(crate::admission::Channel::Native) => false,
+                    None => ctx.excel,
+                }
             };
             let permitted = i.saved.policy.enabled
                 && i.saved.policy.models.permits(model)
@@ -467,12 +473,12 @@ mod tests {
             key: None,
             expires: 1,
         };
-        let first = c.enter(&ctx, "model", "-excel").await;
+        let first = c.enter(&ctx, "model", "-excel", false).await;
         assert!(matches!(c.save(p.clone(), Some(1)), Err((409, _))));
         let mut ctx2 = ctx.clone();
         ctx2.request_id = "r2".into();
         let other = c.clone();
-        let waiting = tokio::spawn(async move { other.enter(&ctx2, "model", "-excel").await });
+        let waiting = tokio::spawn(async move { other.enter(&ctx2, "model", "-excel", false).await });
         tokio::task::yield_now().await;
         assert_eq!(c.snapshot()["waiting"], 1);
         waiting.abort();

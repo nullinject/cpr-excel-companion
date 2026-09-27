@@ -277,7 +277,12 @@ async fn events(
         .and_then(Value::as_str)
         .ok_or_else(|| fail(StatusCode::BAD_REQUEST, "model is required"))?
         .to_owned();
-    let lease = app.control.enter(&ctx, &model, &app.suffix).await;
+    // CPR 的 generate=false 探针/预热：Excel 不支持，走原生透传。
+    let prewarm = source.get("generate") == Some(&Value::Bool(false));
+    let lease = app
+        .control
+        .enter(&ctx, &model, &app.suffix, prewarm)
+        .await;
     if lease.rejected {
         return Err(fail(
             StatusCode::TOO_MANY_REQUESTS,
