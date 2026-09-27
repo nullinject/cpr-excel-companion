@@ -161,7 +161,7 @@ dependencies = [
 
 [[package]]
 name = "cpr-excel-companion"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "async-stream",
  "axum",
@@ -181,7 +181,7 @@ dependencies = [
 
 [[package]]
 name = "cpr-excel-companion-plugin"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "cpr-excel-companion",
  "gateway-plugin-sdk",

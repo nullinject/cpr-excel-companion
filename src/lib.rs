@@ -91,8 +91,15 @@ fn relay_call(item: &Value) -> Result<Value> {
     let key = item["namespace"]
         .as_str()
         .map_or_else(|| name.to_owned(), |ns| format!("{ns}.{name}"));
-    let envelope = if item["type"] == "custom_tool_call" {
-        json!({"name":key,"input":item["input"].as_str().ok_or("custom tool input must be text")?})
+    // CPA/Basis Points selects the client tool through `references` and puts
+    // only its payload in `code`. The previous Rust port emitted an empty
+    // references list and nested {name, arguments/input} in code, which CPA
+    // rejects as `invalid_tool_call`.
+    let payload = if item["type"] == "custom_tool_call" {
+        item["input"]
+            .as_str()
+            .ok_or("custom tool input must be text")?
+            .to_owned()
     } else {
         let args: Value = serde_json::from_str(
             item["arguments"]
@@ -100,13 +107,16 @@ fn relay_call(item: &Value) -> Result<Value> {
                 .ok_or("function arguments must be JSON text")?,
         )
         .map_err(|_| "invalid function arguments")?;
-        json!({"name":key,"arguments":args})
+        if !args.is_object() {
+            return Err("function arguments must be an object");
+        }
+        args.to_string()
     };
     Ok(
         json!({"type":"function_call", "id":function_id(item["id"].as_str(), call_id), "call_id":call_id,
         "name":"run_officejs", "status":"completed", "arguments":json!({
             "summary":format!("Run client tool {key}"), "extended_summary":format!("Relay {key} to the external client"),
-            "code":envelope.to_string(),"destructive":false,"references":[]
+            "code":payload,"destructive":false,"references":[key]
         }).to_string()}),
     )
 }
@@ -189,7 +199,7 @@ pub fn prepare(source: &Value, original_calls: &BTreeMap<String, Value>) -> Resu
         "This is an external Responses client, not a live Excel workbook. Answer in text; do not invoke workbook tools.".to_owned()
     } else {
         format!(
-            "This is an external Responses client. Native run_officejs is an intercepted transport, not an OfficeJS executor. For each client tool, call run_officejs with summary, extended_summary, destructive=false, references=[], and code containing one JSON string: {{\"name\":\"CATALOG_NAME\",\"arguments\":{{}}}} for function tools, or {{\"name\":\"CATALOG_NAME\",\"input\":\"RAW_TEXT\"}} for custom tools. Do not execute OfficeJS or invoke other native tools. Serialize the complete inner JSON object, including backslashes and quotes. Do not nest another run_officejs wrapper. Preserve names and schemas exactly. {} Catalog: {}",
+            "This is an external Responses client. Native run_officejs is an intercepted transport, not an OfficeJS executor. For each client tool, call run_officejs with summary, extended_summary, destructive=false, references=[\"CATALOG_NAME\"], and code containing only the serialized JSON arguments object for function tools, or the unchanged raw input text for custom tools. Do not execute OfficeJS or invoke other native tools. Serialize the complete payload, including backslashes and quotes. Do not nest another run_officejs wrapper. Preserve names and schemas exactly. {} Catalog: {}",
             if source["parallel_tool_calls"] == false {
                 "Make only one tool call per response."
             } else {
@@ -264,13 +274,33 @@ pub fn restore_call(native: &Value, tools: &Tools) -> Result<Value> {
             .ok_or("missing native arguments")?,
     )
     .map_err(|_| "invalid native arguments")?;
-    let envelope = tool_envelope::decode(&args["code"])?;
+    let references = args["references"].as_array().filter(|items| !items.is_empty());
+    let direct_payload = references.is_some();
+    let (tool_key, payload) = if let Some(references) = references {
+        if references.len() != 1 {
+            return Err("references must select exactly one client tool");
+        }
+        let name = references[0]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or("invalid client tool reference")?;
+        if matches!(name, "run_officejs" | "functions.run_officejs") {
+            return Err("client tool reference cannot be run_officejs");
+        }
+        let code = args["code"].as_str().ok_or("tool code must be text")?;
+        (name.to_owned(), json!(code))
+    } else {
+        // Accept the pre-0.8 nested envelope for already persisted histories,
+        // while all newly generated requests use the CPA contract above.
+        let envelope = tool_envelope::decode(&args["code"])?;
+        let name = envelope["name"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or("missing client tool name")?;
+        (name.to_owned(), envelope)
+    };
     let tool = tools
-        .get(
-            envelope["name"]
-                .as_str()
-                .ok_or("missing client tool name")?,
-        )
+        .get(&tool_key)
         .ok_or("upstream requested an undeclared tool")?;
     let call_id = native["call_id"]
         .as_str()
@@ -282,20 +312,32 @@ pub fn restore_call(native: &Value, tools: &Tools) -> Result<Value> {
     }
     if tool.custom {
         output["id"] = json!(format!("ctc_{}", &digest(call_id)[..40]));
-        output["input"] = json!(
-            envelope["input"]
-                .as_str()
-                .ok_or("custom input must be text")?
-        );
-    } else {
-        let args = match &envelope["arguments"] {
-            Value::String(s) => serde_json::from_str(s).map_err(|_| "invalid inner arguments")?,
-            v => v.clone(),
+        output["input"] = if direct_payload {
+            payload
+        } else {
+            payload["input"].clone()
         };
-        if !args.is_object() {
+        if !output["input"].is_string() {
+            return Err("custom input must be text");
+        }
+    } else {
+        let inner = if direct_payload {
+            serde_json::from_str(
+                payload
+                    .as_str()
+                    .ok_or("function code must be text")?,
+            )
+            .map_err(|_| "invalid function arguments")?
+        } else {
+            match &payload["arguments"] {
+                Value::String(s) => serde_json::from_str(s).map_err(|_| "invalid inner arguments")?,
+                v => v.clone(),
+            }
+        };
+        if !inner.is_object() {
             return Err("function arguments must be an object");
         }
-        output["arguments"] = json!(args.to_string());
+        output["arguments"] = json!(inner.to_string());
     }
     Ok(output)
 }
@@ -340,10 +382,51 @@ mod tests {
     fn tool_round_trip_preserves_call_and_payload() {
         let item = json!({"type":"function_call","id":"fc_original","call_id":"call_1","name":"shell","arguments":"{\"cmd\":\"echo 你好\"}"});
         let native = relay_call(&item).unwrap();
+        let outer: Value = serde_json::from_str(native["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(outer["references"], json!(["shell"]));
+        assert_eq!(outer["code"], json!("{\"cmd\":\"echo 你好\"}"));
         let restored = restore_call(&native, &tool_catalog(&source())).unwrap();
         assert_eq!(restored["arguments"], item["arguments"]);
         assert_eq!(restored["id"], item["id"]);
         assert_eq!(restored["call_id"], item["call_id"]);
+    }
+    #[test]
+    fn cpa_reference_payload_round_trip_supports_custom_tools() {
+        let source = json!({
+            "model":"gpt-5.6-sol-excel",
+            "input":"hello",
+            "tools":[{"type":"custom","name":"apply_patch"}]
+        });
+        let item = json!({
+            "type":"custom_tool_call",
+            "id":"ctc_original",
+            "call_id":"call_custom",
+            "name":"apply_patch",
+            "input":"*** Begin Patch\n*** End Patch"
+        });
+        let native = relay_call(&item).unwrap();
+        let restored = restore_call(&native, &tool_catalog(&source)).unwrap();
+        assert_eq!(restored["type"], "custom_tool_call");
+        assert_eq!(restored["input"], item["input"]);
+        assert_eq!(restored["call_id"], item["call_id"]);
+    }
+    #[test]
+    fn legacy_empty_references_preserve_declared_tool_payload() {
+        let tools = tool_catalog(&source());
+        let native = json!({"type":"function_call","call_id":"call_legacy","name":"run_officejs",
+            "arguments":json!({"references":[],"code":json!({"name":"shell","arguments":{"cmd":"echo legacy"}}).to_string()}).to_string()});
+        let restored = restore_call(&native, &tools).unwrap();
+        assert_eq!(restored["name"], "shell");
+        assert_eq!(restored["arguments"], json!({"cmd":"echo legacy"}).to_string());
+    }
+    #[test]
+    fn references_do_not_bypass_declared_tool_validation() {
+        let tools = tool_catalog(&source());
+        for references in [json!([]), json!(["missing"]), json!(["shell","shell"]), json!(["run_officejs"])] {
+            let native = json!({"type":"function_call","call_id":"call_bad","name":"run_officejs",
+                "arguments":json!({"references":references,"code":"{}"}).to_string()});
+            assert!(restore_call(&native, &tools).is_err());
+        }
     }
     #[test]
     fn undeclared_tools_and_native_continuation_are_rejected() {

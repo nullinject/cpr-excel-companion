@@ -31,16 +31,18 @@ def main() -> int:
     connection = psycopg2.connect(**PG)
     try:
         cursor = connection.cursor()
-        cursor.execute("select id, outbound_proxy_url from provider_accounts where enabled")
+        cursor.execute("select id, outbound_proxy_url, upstream_account_id from provider_accounts where enabled AND provider_kind = 'openai'")
         rows = cursor.fetchall()
     finally:
         connection.close()
     accounts = {}
-    for account_id, proxy_url in rows:
+    for account_id, proxy_url, upstream_account_id in rows:
         if proxy_url:
             accounts[account_id] = {"proxy": proxy_url, "direct": False}
         else:
             accounts[account_id] = {"direct": True}
+        if upstream_account_id:
+            accounts[account_id]["upstream_account_id"] = upstream_account_id
     payload = {
         "accounts": accounts,
         "version": datetime.now(timezone.utc).isoformat(timespec="seconds"),

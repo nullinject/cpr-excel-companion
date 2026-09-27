@@ -7,6 +7,8 @@ use std::{
 };
 
 type Cache = BTreeMap<(String, String), (Instant, Vec<Value>)>;
+pub const MISSING: &str = "Excel continuation expired or belongs to another account or key; send full history";
+pub const CACHE_LIMIT: &str = "Excel continuation exceeds the 2 MiB cache budget; resend full input history without previous_response_id";
 fn cache() -> &'static Mutex<Cache> {
     static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
     CACHE.get_or_init(Mutex::default)
@@ -34,13 +36,11 @@ pub fn restore(scope: &str, source: &mut Value) -> Result<()> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     cache.retain(|_, (created, _)| created.elapsed() < Duration::from_secs(1800));
-    let (_, prior) = cache.get(&(scope.to_owned(), previous.to_owned())).ok_or(
-        "Excel continuation expired or belongs to another account or key; send full history",
-    )?;
+    let (_, prior) = cache.get(&(scope.to_owned(), previous.to_owned())).ok_or(MISSING)?;
     let mut history = prior.clone();
     history.extend(input(source)?);
     if serde_json::to_vec(&history).map_or(true, |bytes| bytes.len() > 2 * 1024 * 1024) {
-        return Err("Excel continuation history exceeds 2 MiB; start a new conversation");
+        return Err(CACHE_LIMIT);
     }
     source["input"] = Value::Array(history);
     source
@@ -62,9 +62,9 @@ pub fn prewarm(scope: &str, source: &Value) -> Result<Vec<Value>> {
         .remove("generate");
     restore(scope, &mut source)?;
     let input = input(&source)?;
-    if serde_json::to_vec(&input).map_or(true, |b| b.len() > 2 * 1024 * 1024) {
-        return Err("Excel prewarm history exceeds 2 MiB");
-    }
+    // The request decoder still enforces 32 MiB. The 2 MiB limit belongs
+    // to the replay cache, not the conversation: save() skips large entries,
+    // and a later delta gets the normal full-history replay signal.
     let model = source["model"].as_str().ok_or("model is required")?;
     let response = json!({
         "id": format!("resp_{}", uuid::Uuid::new_v4().simple()),
@@ -117,6 +117,19 @@ pub fn save(scope: &str, input: &[Value], response: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn oversized_prewarm_is_stateless_and_does_not_block_full_replay() {
+        let source = json!({"model":"gpt-6-sol","generate":false,"input":"x".repeat(2 * 1024 * 1024)});
+        let events = prewarm("oversized-prewarm", &source).unwrap();
+        let response = &events[2]["response"];
+        assert_eq!(response["usage"]["total_tokens"], 0);
+        let mut delta = json!({"previous_response_id":response["id"],"input":"next"});
+        assert!(restore("oversized-prewarm", &mut delta).is_err());
+        let mut full = source.clone();
+        full.as_object_mut().unwrap().remove("generate");
+        restore("oversized-prewarm", &mut full).unwrap();
+        assert_eq!(full["input"], source["input"]);
+    }
     #[test]
     fn replay_keeps_history_and_isolates_keys() {
         save(

@@ -234,7 +234,7 @@ mod tests {
     fn tool_call_is_emitted_once_and_preserves_original() {
         let source = json!({"tools":[{"type":"custom","name":"apply_patch"}]});
         let mut t = Translator::new(super::super::tool_catalog(&source));
-        let native = json!({"type":"function_call","id":"fc_native","call_id":"call_1","name":"run_officejs","arguments":json!({"code":json!({"name":"apply_patch","input":"*** Begin Patch\n*** End Patch"}).to_string()}).to_string()});
+        let native = json!({"type":"function_call","id":"fc_native","call_id":"call_1","name":"run_officejs","arguments":json!({"code":"*** Begin Patch\n*** End Patch","references":["apply_patch"]}).to_string()});
         assert!(
             t.event(json!({"type":"response.output_item.added","output_index":0,"item":native}))
                 .unwrap()
