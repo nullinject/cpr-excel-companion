@@ -327,13 +327,7 @@ async fn events(
             note("attachment upload failed".into());
             return Err(fail(StatusCode::BAD_GATEWAY, "attachment upload failed"));
         }
-        tools = match excel::tool_catalog(&source) {
-            Ok(tools) => tools,
-            Err(e) => {
-                note(format!("tool catalog: {e}"));
-                return Err(fail(StatusCode::BAD_REQUEST, e));
-            }
-        };
+        tools = excel::tool_catalog(&source);
         body = match excel::prepare(&source, &excel::cache_load(&scope)) {
             Ok(body) => body,
             Err(e) => {
