@@ -186,6 +186,7 @@ mod tests {
                     scope: "test".into(),
                     request_id: uuid::Uuid::new_v4().to_string(),
                     excel,
+                    key: None,
                     expires: SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .unwrap()

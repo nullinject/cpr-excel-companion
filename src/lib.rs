@@ -36,65 +36,50 @@ pub struct Tool {
 }
 pub type Tools = BTreeMap<String, Tool>;
 
-pub fn tool_catalog(source: &Value) -> Result<Tools> {
-    match source.get("tool_choice") {
-        None | Some(Value::Null) => {}
-        Some(Value::String(s)) if s == "auto" => {}
-        Some(Value::String(s)) if s == "none" => return Ok(Tools::new()),
-        _ => return Err("only tool_choice auto and none are supported"),
-    }
-    fn add(items: &[Value], namespace: Option<&str>, out: &mut Tools) -> Result<()> {
-        for item in items {
-            let kind = item["type"].as_str().ok_or("tool type is required")?;
-            let name = item["name"].as_str().ok_or("tool name is required")?;
-            if name.is_empty() {
-                return Err("empty tool name");
-            }
-            if kind == "namespace" {
-                if namespace.is_some() {
-                    return Err("nested namespaces are unsupported");
+pub fn tool_catalog(source: &Value) -> Tools {
+    // 与原版/CPA 插件对齐：只有 tool_choice=none 清空目录；其余值按 auto 处理。
+    // 只收割 function/custom（含 namespace 递归与输入历史 additional_tools），
+    // 其他类型（web_search/local_shell 等）上游不可执行，静默跳过。
+    let mut out = Tools::new();
+    let none = source
+        .get("tool_choice")
+        .and_then(Value::as_str)
+        .is_some_and(|s| s.eq_ignore_ascii_case("none"));
+    if !none {
+        fn add(items: &Value, namespace: Option<&str>, out: &mut Tools) {
+            let Some(list) = items.as_array() else { return };
+            for item in list {
+                let kind = item["type"].as_str().unwrap_or("").trim().to_lowercase();
+                let name = item["name"].as_str().unwrap_or("").trim();
+                if (kind == "function" || kind == "custom") && !name.is_empty() {
+                    let key =
+                        namespace.map_or_else(|| name.to_owned(), |ns| format!("{ns}.{name}"));
+                    out.insert(
+                        key,
+                        Tool {
+                            name: name.to_owned(),
+                            namespace: namespace.map(str::to_owned),
+                            custom: kind == "custom",
+                            spec: item.clone(),
+                        },
+                    );
+                } else if kind == "namespace" && !name.is_empty() {
+                    add(&item["tools"], Some(name), out);
                 }
-                add(
-                    item["tools"]
-                        .as_array()
-                        .ok_or("namespace tools are required")?,
-                    Some(name),
-                    out,
-                )?;
-                continue;
-            }
-            if !matches!(kind, "function" | "custom") {
-                return Err(
-                    "unsupported built-in tool; only function and custom tools are supported",
-                );
-            }
-            let key = namespace.map_or_else(|| name.to_owned(), |ns| format!("{ns}.{name}"));
-            if out
-                .insert(
-                    key,
-                    Tool {
-                        name: name.into(),
-                        namespace: namespace.map(str::to_owned),
-                        custom: kind == "custom",
-                        spec: item.clone(),
-                    },
-                )
-                .is_some()
-            {
-                return Err("duplicate tool name");
             }
         }
-        Ok(())
+        add(&source["tools"], None, &mut out);
+        // Codex 0.158+ 把动态工具目录放进输入历史的 additional_tools 项；
+        // 后续声明覆盖同名工具。
+        if let Some(items) = source["input"].as_array() {
+            for item in items {
+                if item["type"].as_str().is_some_and(|k| k.eq_ignore_ascii_case("additional_tools")) {
+                    add(&item["tools"], None, &mut out);
+                }
+            }
+        }
     }
-    let mut out = Tools::new();
-    if let Some(items) = source.get("tools") {
-        add(
-            items.as_array().ok_or("tools must be an array")?,
-            None,
-            &mut out,
-        )?;
-    }
-    Ok(out)
+    out
 }
 
 fn relay_call(item: &Value) -> Result<Value> {
@@ -150,7 +135,7 @@ pub fn prepare(source: &Value, original_calls: &BTreeMap<String, Value>) -> Resu
     {
         return Err("structured output formats are not supported");
     }
-    let tools = tool_catalog(source)?;
+    let tools = tool_catalog(source);
     let model = source["model"]
         .as_str()
         .filter(|s| !s.is_empty())
@@ -160,10 +145,12 @@ pub fn prepare(source: &Value, original_calls: &BTreeMap<String, Value>) -> Resu
         .pointer("/reasoning/effort")
         .and_then(Value::as_str)
         .or_else(|| source["reasoning_effort"].as_str())
-        .unwrap_or("medium");
-    if !["low", "medium", "high", "xhigh"].contains(&effort) {
-        return Err("unsupported reasoning effort; no silent downgrade is performed");
-    }
+        .map(|value| match value.trim().to_lowercase().as_str() {
+            "x-high" | "extra-high" | "extra_high" | "max" => "xhigh".to_owned(),
+            other => other.to_owned(),
+        })
+        .filter(|value| ["low", "medium", "high", "xhigh"].contains(&value.as_str()))
+        .unwrap_or_else(|| "medium".to_owned());
     let raw = match &source["input"] {
         Value::String(s) => {
             vec![json!({"type":"message","role":"user","content":[{"type":"input_text","text":s}]})]
@@ -242,9 +229,9 @@ pub fn prepare(source: &Value, original_calls: &BTreeMap<String, Value>) -> Resu
                     );
                 }
             }
-            "item_reference" => {
-                return Err("item_reference requires unavailable upstream stored state");
-            }
+            // item_reference 与 additional_tools 上游不接受：前者丢弃，
+            // 后者的工具已在目录收割阶段并入（与 CPA 插件一致）。
+            "item_reference" | "additional_tools" => {}
             _ => {
                 input.push(item);
             }
@@ -328,7 +315,11 @@ mod tests {
         assert!(a.get("tools").is_none());
         let mut s = s;
         s["reasoning"] = json!({"effort":"max"});
-        assert!(prepare(&s, &BTreeMap::new()).is_err());
+        let prepared = prepare(&s, &BTreeMap::new()).unwrap();
+        assert_eq!(prepared["reasoning_effort"], "xhigh");
+        s["reasoning"] = json!({"effort":"ultra"});
+        let prepared = prepare(&s, &BTreeMap::new()).unwrap();
+        assert_eq!(prepared["reasoning_effort"], "medium");
     }
     #[test]
     fn tool_result_ids_preserve_valid_and_fix_invalid() {
@@ -349,7 +340,7 @@ mod tests {
     fn tool_round_trip_preserves_call_and_payload() {
         let item = json!({"type":"function_call","id":"fc_original","call_id":"call_1","name":"shell","arguments":"{\"cmd\":\"echo 你好\"}"});
         let native = relay_call(&item).unwrap();
-        let restored = restore_call(&native, &tool_catalog(&source()).unwrap()).unwrap();
+        let restored = restore_call(&native, &tool_catalog(&source())).unwrap();
         assert_eq!(restored["arguments"], item["arguments"]);
         assert_eq!(restored["id"], item["id"]);
         assert_eq!(restored["call_id"], item["call_id"]);
@@ -360,7 +351,7 @@ mod tests {
         s["previous_response_id"] = json!("resp_x");
         assert!(prepare(&s, &BTreeMap::new()).is_err());
         let n = json!({"name":"run_officejs","call_id":"a","arguments":json!({"code":"{\"name\":\"unlisted\",\"arguments\":{}}"}).to_string()});
-        assert!(restore_call(&n, &tool_catalog(&source()).unwrap()).is_err());
+        assert!(restore_call(&n, &tool_catalog(&source())).is_err());
     }
 }
 
@@ -368,11 +359,14 @@ mod tests {
 mod request_regression {
     use super::*;
     #[test]
-    fn none_disables_tools_and_forced_choices_are_rejected() {
+    fn none_disables_tools_and_other_choices_behave_like_auto() {
         let mut source = json!({"model":"gpt-5.6-sol-excel","input":"hello","tools":[{"type":"function","name":"shell"}],"tool_choice":"none"});
-        assert!(tool_catalog(&source).unwrap().is_empty());
+        assert!(tool_catalog(&source).is_empty());
         source["tool_choice"] = json!("required");
-        assert!(prepare(&source, &BTreeMap::new()).is_err());
+        source["tools"] = json!([{"type":"function","name":"shell"},{"type":"web_search"}]);
+        let catalog = tool_catalog(&source);
+        assert_eq!(catalog.len(), 1);
+        assert!(catalog.contains_key("shell"));
     }
     #[test]
     fn structured_format_is_not_silently_ignored() {
