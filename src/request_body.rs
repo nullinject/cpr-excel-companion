@@ -164,6 +164,7 @@ mod tests {
         };
         control.save(policy, Some(0)).unwrap();
         let app = Arc::new(App {
+            clients: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             secret: secret.clone(),
             config_path: absent.join("accounts.json").to_string_lossy().into_owned(),
             control,
