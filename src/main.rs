@@ -390,8 +390,17 @@ async fn events(
         let mut decoder = excel::stream::Decoder::default();
         let mut translator = excel::stream::Translator::new(tools);
         let mut terminal = false;
-        while let Some(chunk) = wire.next().await {
-            let chunk = match chunk { Ok(c) => c, Err(_) => { yield Err("upstream stream interrupted"); return; } };
+        // 上游静默期插 SSE 注释保活：反代（Cloudflare ~100s 空闲超时）不会掐断长思考。
+        loop {
+            let chunk = match tokio::time::timeout(Duration::from_secs(15), wire.next()).await {
+                Ok(Some(Ok(c))) => c,
+                Ok(Some(Err(_))) => { yield Err("upstream stream interrupted"); return; }
+                Ok(None) => break,
+                Err(_elapsed) => {
+                    yield Ok(json!({"type":"bridge.comment","text":"keepalive"}));
+                    continue;
+                }
+            };
             let input = match decoder.push(&chunk) { Ok(v) => v, Err(e) => { yield Err(e); return; } };
             for event in input {
                 let output = if ctx.excel { translator.event(event) } else { Ok(vec![event]) };
@@ -485,8 +494,16 @@ async fn unsigned_events(
     Ok(Box::pin(async_stream::stream! {
         let mut decoder = excel::stream::Decoder::default();
         let mut terminal = false;
-        while let Some(chunk) = wire.next().await {
-            let chunk = match chunk { Ok(c) => c, Err(_) => { yield Err("upstream stream interrupted"); return; } };
+        loop {
+            let chunk = match tokio::time::timeout(Duration::from_secs(15), wire.next()).await {
+                Ok(Some(Ok(c))) => c,
+                Ok(Some(Err(_))) => { yield Err("upstream stream interrupted"); return; }
+                Ok(None) => break,
+                Err(_elapsed) => {
+                    yield Ok(json!({"type":"bridge.comment","text":"keepalive"}));
+                    continue;
+                }
+            };
             let input = match decoder.push(&chunk) { Ok(v) => v, Err(e) => { yield Err(e); return; } };
             for event in input {
                 terminal = matches!(event["type"].as_str(), Some("response.completed"|"response.failed"|"response.incomplete"));
