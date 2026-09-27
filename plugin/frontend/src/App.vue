@@ -126,7 +126,7 @@ onUnmounted(() => {
             <tr v-for="row in rows()" :key="row.request_id">
               <td>{{ new Date(row.started_at_ms).toLocaleTimeString() }}</td>
               <td>{{ row.model }}<small>{{ row.request_id }}</small></td>
-              <td>{{ row.status }}<small v-if="row.source === 'host'">宿主观察</small></td>
+              <td>{{ row.status }}<small v-if="row.source === 'host'">宿主观察</small><small v-else-if="row.source === 'unsigned'">未签名透传</small></td>
               <td>{{ row.account_id ?? '—' }}<small>{{ row.client_key_id ?? '—' }}</small></td>
               <td>{{ row.queue_ms ?? '—' }} ms</td>
               <td>{{ row.finished_at_ms == null ? '—' : row.finished_at_ms - row.started_at_ms }} ms</td>
@@ -144,7 +144,7 @@ onUnmounted(() => {
     </BaseCard>
     <form v-if="tab === 'settings' && policy" @submit.prevent="save">
       <BaseCard>
-        <p>开启后，符合模型和 Key 范围的请求自动使用 Excel，直接填写原模型名即可。关闭或不匹配时走原链路。</p>
+        <p>按 Key × 模型切换：在 CPR 插件实例的「绑定」里配置 clientKeyIds 与 models——命中的请求由本插件签名走 Excel（excelMode=suffix 时由客户端模型名后缀决定，always/never 固定），未命中的 Key 由桥接自动原生透传。此页的模型/账户/Key 范围是桥接侧的准入门（并发与队列），黑名单优先，白名单留空表示不限。</p>
         <div class="settings">
           <label for="enabled"> <input id="enabled" v-model="policy.enabled" type="checkbox"> 开启 Excel 网关</label>
           <label for="concurrency">最大并发 <input id="concurrency" v-model.number="policy.concurrency" type="number" min="1" max="1024" required></label>

@@ -34,14 +34,15 @@ struct Account {
 struct Config {
     accounts: BTreeMap<String, Account>,
     /// 同步脚本写入的元数据；桥接只读 accounts。
-    #[serde(default)]
-    version: Option<String>,
+    #[serde(default, rename = "version")]
+    _version: Option<String>,
 }
 struct App {
     secret: Vec<u8>,
     config_path: String,
     control: Arc<excel::control::Control>,
     suffix: String,
+    allow_unsigned: bool,
 }
 fn fail(status: StatusCode, message: &'static str) -> Failure {
     (
@@ -49,38 +50,67 @@ fn fail(status: StatusCode, message: &'static str) -> Failure {
         axum::Json(json!({"error":{"type":"excel_bridge_error","message":message}})),
     )
 }
-fn context(headers: &HeaderMap, app: &App) -> Result<Context, Failure> {
-    let raw = headers
-        .get("x-excel-bridge-context")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "bridge context required"))?;
+/// 连接级身份：有签名为 Some(ctx)；无签名为 None（仅原生透传，见 App::allow_unsigned）。
+#[derive(Clone)]
+enum Identity {
+    Signed(Box<Context>),
+    Unsigned,
+}
+fn context(headers: &HeaderMap, app: &App) -> Result<Identity, Failure> {
+    let Some(raw) = headers.get("x-excel-bridge-context").and_then(|v| v.to_str().ok()) else {
+        // 绑定未命中的 key（宿主不调用插件）走这里：只允许原生透传。
+        if app.allow_unsigned {
+            return Ok(Identity::Unsigned);
+        }
+        return Err(fail(StatusCode::SERVICE_UNAVAILABLE, "bridge context required"));
+    };
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
     excel::auth::verify(raw, &app.secret, now)
+        .map(|ctx| Identity::Signed(Box::new(ctx)))
         .map_err(|_| fail(StatusCode::SERVICE_UNAVAILABLE, "invalid bridge context"))
 }
 fn client(app: &App, ctx: &Context) -> Result<reqwest::Client, Failure> {
     // 每次请求读取原子替换的代理映射，避免继续使用已撤销的账户或旧代理。
+    let config = read_config(app)?;
+    let route = config.accounts.get(&ctx.account).ok_or_else(|| {
+        fail(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "account is not configured for this bridge",
+        )
+    })?;
+    client_for_route(route)
+}
+fn unsigned_client(app: &App, account_id: Option<&str>) -> Result<reqwest::Client, Failure> {
+    let config = read_config(app)?;
+    let route = account_id
+        .and_then(|id| config.accounts.get(id))
+        .or_else(|| config.accounts.values().next())
+        .ok_or_else(|| {
+            fail(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "account map has no accounts",
+            )
+        })?;
+    client_for_route(route)
+}
+fn read_config(app: &App) -> Result<Config, Failure> {
     let data = std::fs::read(&app.config_path).map_err(|_| {
         fail(
             StatusCode::SERVICE_UNAVAILABLE,
             "bridge account map unavailable",
         )
     })?;
-    let config: Config = serde_json::from_slice(&data).map_err(|_| {
+    serde_json::from_slice(&data).map_err(|_| {
         fail(
             StatusCode::SERVICE_UNAVAILABLE,
             "invalid bridge account map",
         )
-    })?;
-    let account = config.accounts.get(&ctx.account).ok_or_else(|| {
-        fail(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "account is not configured for this bridge",
-        )
-    })?;
+    })
+}
+fn client_for_route(account: &Account) -> Result<reqwest::Client, Failure> {
     let mut builder = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
@@ -195,10 +225,23 @@ fn upstream_headers(incoming: &HeaderMap, is_excel: bool) -> Result<HeaderMap, F
 }
 async fn events(
     app: Arc<App>,
-    connection: Context,
+    identity: Identity,
     headers: HeaderMap,
     mut source: Value,
 ) -> Result<Events, Failure> {
+    // 未签名连接：绑定未命中的 key，仅原生透传；-excel 后缀在此还原避免上游拒绝。
+    let connection = match identity {
+        Identity::Unsigned => {
+            let model = source
+                .get("model")
+                .and_then(Value::as_str)
+                .and_then(|m| m.strip_suffix(&app.suffix))
+                .filter(|m| !m.is_empty())
+                .map(str::to_owned);
+            return unsigned_events(app, headers, source, model).await;
+        }
+        Identity::Signed(ctx) => *ctx,
+    };
     let token = source
         .get_mut("client_metadata")
         .and_then(Value::as_object_mut)
@@ -364,15 +407,104 @@ async fn events(
         if !terminal { yield Err("upstream ended without a terminal event"); }
     }))
 }
+/// 绑定未命中 key 的原生透传：无签名、无 Excel 转换、不占用 Excel 并发预算。
+async fn unsigned_events(
+    app: Arc<App>,
+    headers: HeaderMap,
+    mut source: Value,
+    stripped_model: Option<String>,
+) -> Result<Events, Failure> {
+    let model = match stripped_model {
+        Some(model) => model,
+        None => source
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|m| !m.is_empty())
+            .ok_or_else(|| fail(StatusCode::BAD_REQUEST, "model is required"))?
+            .to_owned(),
+    };
+    if let Some(object) = source.as_object_mut() {
+        object.insert("model".into(), json!(model));
+        object.remove("type");
+        object["stream"] = json!(true);
+    }
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let account_id = headers
+        .get("chatgpt-account-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let lease = app
+        .control
+        .enter_unsigned(&request_id, &model, account_id.as_deref())
+        .map_err(|e| fail(StatusCode::SERVICE_UNAVAILABLE, e))?;
+    let client = match unsigned_client(&app, account_id.as_deref()) {
+        Ok(client) => client,
+        Err((status, error)) => {
+            lease.fail("unsigned client build failed");
+            return Err((status, error));
+        }
+    };
+    let upstream = match upstream_headers(&headers, false) {
+        Ok(upstream) => upstream,
+        Err((status, error)) => {
+            lease.fail("upstream headers rejected");
+            return Err((status, error));
+        }
+    };
+    let response = match client
+        .post("https://chatgpt.com/backend-api/codex/responses")
+        .headers(upstream)
+        .json(&source)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            lease.fail(&format!("upstream connection failed: {error}"));
+            return Err(fail(StatusCode::BAD_GATEWAY, "upstream connection failed"));
+        }
+    };
+    if !response.status().is_success() {
+        let status = response.status();
+        let detail = response.text().await.unwrap_or_default();
+        let trimmed = detail.trim();
+        let cut = trimmed.char_indices().nth(512).map_or(trimmed.len(), |(i, _)| i);
+        lease.fail(&format!("upstream status {status}: {}", &trimmed[..cut]));
+        return Err((
+            status,
+            axum::Json(json!({"error":{"type":"excel_bridge_error",
+                "message":format!("upstream status {status}")}})),
+        ));
+    }
+    app.control.running(&request_id, 0);
+    let mut wire = response.bytes_stream();
+    Ok(Box::pin(async_stream::stream! {
+        let mut decoder = excel::stream::Decoder::default();
+        let mut terminal = false;
+        while let Some(chunk) = wire.next().await {
+            let chunk = match chunk { Ok(c) => c, Err(_) => { yield Err("upstream stream interrupted"); return; } };
+            let input = match decoder.push(&chunk) { Ok(v) => v, Err(e) => { yield Err(e); return; } };
+            for event in input {
+                terminal = matches!(event["type"].as_str(), Some("response.completed"|"response.failed"|"response.incomplete"));
+                if terminal {
+                    app.control.finish_unsigned(&request_id, &event);
+                }
+                yield Ok(event);
+                if terminal { return; }
+            }
+        }
+        if !terminal { yield Err("upstream ended without a terminal event"); }
+    }))
+}
 async fn http(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Failure> {
-    let ctx = context(&headers, &app)?;
+    let identity = context(&headers, &app)?;
     let source: Value = serde_json::from_slice(&body)
         .map_err(|_| fail(StatusCode::BAD_REQUEST, "invalid JSON request"))?;
-    let mut stream = events(app, ctx, headers, source).await?;
+    let mut stream = events(app, identity, headers, source).await?;
     let bytes = async_stream::stream! {
         while let Some(event) = stream.next().await {
             match event {
@@ -396,10 +528,10 @@ async fn ws(
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Result<Response, Failure> {
-    let ctx = context(&headers, &app)?;
+    let identity = context(&headers, &app)?;
     Ok(upgrade
         .max_message_size(32 * 1024 * 1024)
-        .on_upgrade(move |socket| websocket(socket, app, ctx, headers)))
+        .on_upgrade(move |socket| websocket(socket, app, identity, headers)))
 }
 async fn next_data(socket: &mut WebSocket) -> Option<Result<Message, axum::Error>> {
     loop {
@@ -409,7 +541,7 @@ async fn next_data(socket: &mut WebSocket) -> Option<Result<Message, axum::Error
         }
     }
 }
-async fn websocket(mut socket: WebSocket, app: Arc<App>, ctx: Context, headers: HeaderMap) {
+async fn websocket(mut socket: WebSocket, app: Arc<App>, identity: Identity, headers: HeaderMap) {
     while let Some(Ok(message)) = next_data(&mut socket).await {
         let Message::Text(text) = message else {
             if matches!(message, Message::Close(_)) {
@@ -430,7 +562,7 @@ async fn websocket(mut socket: WebSocket, app: Arc<App>, ctx: Context, headers: 
         }
         // 每个连接严格串行；发送方断开时立即丢弃上游 future 和响应流。
         let opened = tokio::select! {
-            result = events(app.clone(), ctx.clone(), headers.clone(), source) => result,
+            result = events(app.clone(), identity.clone(), headers.clone(), source) => result,
             _ = next_data(&mut socket) => return,
         };
         match opened {
@@ -545,6 +677,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         secret,
         config_path: std::env::var("EXCEL_BRIDGE_ACCOUNT_MAP")?,
         suffix: std::env::var("EXCEL_BRIDGE_MODEL_SUFFIX").unwrap_or_else(|_| "-excel".into()),
+        allow_unsigned: std::env::var("EXCEL_BRIDGE_ALLOW_UNSIGNED")
+            .map(|v| v != "0" && v.to_lowercase() != "false")
+            .unwrap_or(true),
     });
     let router = Router::new()
         .route("/healthz", get(|| async { StatusCode::NO_CONTENT }))

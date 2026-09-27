@@ -30,6 +30,18 @@
 2. Provider 把账户出口代理无条件套用到 base_url 连接（`Proxy::all`，无回环豁免）。桥接必须经账户代理可达：部署时通过反代公网路由（如 Caddy `/excel-companion/*`）回源，桥接再按映射代理回 BPS。
 3. 宿主按请求元数据覆写正文 `model` 字段，插件层改写无效。`-excel` 后缀由桥接的 `prepare()` 还原为上游模型名。
 
+## 按 Key × 模型切换 Excel / 原生
+
+切换由两层机制组合完成，全部在生产验证过：
+
+1. **CPR 实例绑定（服务端控制）**：插件实例的「绑定」中配置 `clientKeyIds` 与 `models`——宿主持有 key 身份并按绑定过滤，只有命中的请求会触发签名走 Excel。绑定列表的增删即时生效（保存配置即可，无需重新打包）。
+2. **模型名后缀（客户端选择）**：`excelMode=suffix`（默认）时，绑定内的 key 用 `-excel` 后缀模型名走 Excel、用原模型名走原生，同一个 key 下自由混用。
+3. **未绑定自动降级**：绑定未命中的 key，请求到达桥接时无签名，桥接按原生透传处理（自动还原 `-excel` 后缀名，避免上游拒绝），记录标记为「未签名透传」并同样归并真实 Key 身份。
+
+组合示例：绑定 `clientKeyIds=[keyA]`、`models=[gpt-5.6-sol-excel]` 时——keyA 发 `gpt-5.6-sol-excel` 走 Excel；keyA 发 `gpt-5.6-sol` 走原生；keyB 发任何模型都走原生。把某模型加入/移出绑定 models 列表即完成切换。
+
+`excelMode` 三种取值：`suffix`（按后缀判定）、`always`（命中绑定即 Excel，适合绑定基础模型名让客户端无感）、`never`（命中绑定也原生，预留）。
+
 ## 验证记录（2026-09-27，生产实测）
 
 原生透传（gpt-5.6-sol，13 input tokens）、Excel 非流式（gpt-5.6-sol/terra-excel，22356 input = BPS 固定前缀）、Excel 流式（gpt-6-astra-excel，SSE + [DONE]）、WebSocket 上游传输、CPR `model_requests` 用量与计费、侧边栏观察归并（真实 Key ID、上游模型、错误码）全部通过。
