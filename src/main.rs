@@ -17,15 +17,15 @@ use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     pin::Pin,
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 mod request_body;
 
 type Events = Pin<Box<dyn Stream<Item = Result<Value, &'static str>> + Send>>;
 type Failure = (StatusCode, axum::Json<Value>);
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct Account {
     proxy: Option<String>,
@@ -45,6 +45,7 @@ struct App {
     control: Arc<excel::control::Control>,
     suffix: String,
     allow_unsigned: bool,
+    clients: Mutex<BTreeMap<String, (Account, reqwest::Client)>>,
 }
 fn fail(status: StatusCode, message: &'static str) -> Failure {
     (
@@ -64,7 +65,10 @@ fn context(headers: &HeaderMap, app: &App) -> Result<Identity, Failure> {
         if app.allow_unsigned {
             return Ok(Identity::Unsigned);
         }
-        return Err(fail(StatusCode::SERVICE_UNAVAILABLE, "bridge context required"));
+        return Err(fail(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "bridge context required",
+        ));
     };
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -83,7 +87,7 @@ fn client(app: &App, ctx: &Context) -> Result<reqwest::Client, Failure> {
             "account is not configured for this bridge",
         )
     })?;
-    client_for_route(route)
+    cached_client(app, &ctx.account, route)
 }
 fn unsigned_client(app: &App, account_id: Option<&str>) -> Result<reqwest::Client, Failure> {
     let config = read_config(app)?;
@@ -96,7 +100,7 @@ fn unsigned_client(app: &App, account_id: Option<&str>) -> Result<reqwest::Clien
                 "account map has no accounts",
             )
         })?;
-    client_for_route(route)
+    cached_client(app, account_id.unwrap_or("unsigned"), route)
 }
 fn read_config(app: &App) -> Result<Config, Failure> {
     let data = std::fs::read(&app.config_path).map_err(|_| {
@@ -112,10 +116,78 @@ fn read_config(app: &App) -> Result<Config, Failure> {
         )
     })
 }
+fn cached_client(app: &App, id: &str, route: &Account) -> Result<reqwest::Client, Failure> {
+    let mut clients = app
+        .clients
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((previous, client)) = clients.get(id)
+        && previous == route
+    {
+        return Ok(client.clone());
+    }
+    let client = client_for_route(route)?;
+    if clients.len() >= 256 {
+        clients.clear();
+    }
+    clients.insert(id.to_owned(), (route.clone(), client.clone()));
+    Ok(client)
+}
+// Opt-in, short-lived forensic capture. Never capture headers, credentials or full requests.
+// An operator supplies a key hash + expiry; at most 8 failed tool events are saved privately.
+fn capture_tool_failure(app: &App, ctx: &Context, event: &Value) {
+    let Some(parent) = std::path::Path::new(&app.config_path).parent() else {
+        return;
+    };
+    let Ok(bytes) = std::fs::read(parent.join("diagnostics.json")) else {
+        return;
+    };
+    let Ok(config) = serde_json::from_slice::<Value>(&bytes) else {
+        return;
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let expiry = config["expires"].as_u64().unwrap_or(0);
+    if expiry <= now
+        || expiry > now + 1800
+        || ctx.key.as_deref() != config["key_hash"].as_str()
+        || ctx.key.is_none()
+    {
+        return;
+    }
+    if event.pointer("/item/type").and_then(Value::as_str) != Some("function_call") {
+        return;
+    }
+    let data = json!({"request_id":ctx.request_id,"event":event}).to_string();
+    if data.len() > 128 * 1024 {
+        return;
+    }
+    use std::io::Write;
+    for index in 0..8 {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        if let Ok(mut file) = options.open(parent.join(format!("tool-diagnostic-{index}.json"))) {
+            if file.write_all(data.as_bytes()).is_err() {
+                eprintln!("tool diagnostic write failed");
+            }
+            break;
+        }
+    }
+}
 fn client_for_route(account: &Account) -> Result<reqwest::Client, Failure> {
     let mut builder = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
+        .pool_idle_timeout(Duration::from_secs(60))
+        .pool_max_idle_per_host(3)
+        .tcp_keepalive(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(30))
         .timeout(Duration::from_secs(600));
     match &account.proxy {
@@ -198,7 +270,10 @@ fn upstream_headers(incoming: &HeaderMap, is_excel: bool) -> Result<HeaderMap, F
         for (name, value) in [
             ("x-basispoints-auth-mode", "chatgpt"),
             ("origin", "https://bps.openai.com"),
-            ("x-openai-internal-basispoints-client-agent-profile", "excel"),
+            (
+                "x-openai-internal-basispoints-client-agent-profile",
+                "excel",
+            ),
             ("x-openai-internal-basispoints-client-editor", "excel"),
             ("x-openai-internal-basispoints-client-host", "office"),
             ("x-openai-internal-basispoints-client-platform", "excel"),
@@ -253,8 +328,15 @@ fn terminal_errors(mut stream: Events) -> Events {
         }
     })
 }
-async fn events(app: Arc<App>, identity: Identity, headers: HeaderMap, source: Value) -> Result<Events, Failure> {
-    open_events(app, identity, headers, source).await.map(terminal_errors)
+async fn events(
+    app: Arc<App>,
+    identity: Identity,
+    headers: HeaderMap,
+    source: Value,
+) -> Result<Events, Failure> {
+    open_events(app, identity, headers, source)
+        .await
+        .map(terminal_errors)
 }
 
 async fn open_events(
@@ -263,6 +345,7 @@ async fn open_events(
     headers: HeaderMap,
     mut source: Value,
 ) -> Result<Events, Failure> {
+    let started = Instant::now();
     // 未签名连接：绑定未命中的 key，仅原生透传；-excel 后缀在此还原避免上游拒绝。
     let connection = match identity {
         Identity::Unsigned => {
@@ -397,7 +480,14 @@ async fn open_events(
     } else {
         "https://chatgpt.com/backend-api/codex/responses"
     };
-    let response = match client.post(endpoint).headers(headers).json(&body).send().await {
+    let upstream_started = Instant::now();
+    let response = match client
+        .post(endpoint)
+        .headers(headers)
+        .json(&body)
+        .send()
+        .await
+    {
         Ok(response) => response,
         Err(error) => {
             note(format!("upstream connection failed: {error}"));
@@ -407,12 +497,8 @@ async fn open_events(
     if !response.status().is_success() {
         let status = response.status();
         // 上游拒绝原因对排障关键；截断后随错误体返回给宿主重试链路。
-        let response_headers = format!("{:?}", response.headers());
         let detail = response.text().await.unwrap_or_default();
-        eprintln!(
-            "bridge request {} upstream status {status}, headers {response_headers}",
-            ctx.request_id
-        );
+        eprintln!("bridge request {} upstream status {status}", ctx.request_id);
         let mut message = format!("upstream status {status}");
         let detail = detail.trim();
         if !detail.is_empty() {
@@ -427,12 +513,21 @@ async fn open_events(
             axum::Json(json!({"error":{"type":"excel_bridge_error","message":message}})),
         ));
     }
+    eprintln!(
+        "bridge timing {} prepared_ms={} upstream_headers_ms={} status={}",
+        ctx.request_id,
+        upstream_started.duration_since(started).as_millis(),
+        upstream_started.elapsed().as_millis(),
+        response.status().as_u16()
+    );
     let mut wire = response.bytes_stream();
     Ok(Box::pin(async_stream::stream! {
         let lease = lease;
         let mut decoder = excel::stream::Decoder::default();
         let mut translator = excel::stream::Translator::new(tools);
         let mut terminal = false;
+        let mut first_event = true;
+        let mut last_event = String::new();
         // 上游静默期插 SSE 注释保活：反代（Cloudflare ~100s 空闲超时）不会掐断长思考。
         loop {
             let chunk = match tokio::time::timeout(Duration::from_secs(15), wire.next()).await {
@@ -446,11 +541,14 @@ async fn open_events(
             };
             let input = match decoder.push(&chunk) { Ok(v) => v, Err(e) => { lease.fail(e); eprintln!("bridge stream {} failed: {e}", ctx.request_id); yield Err(e); return; } };
             for event in input {
-                let output = if ctx.excel { translator.event(event) } else { Ok(vec![event]) };
+                last_event = event["type"].as_str().unwrap_or("unknown").to_owned();
+                if first_event { eprintln!("bridge timing {} first_event_ms={}", ctx.request_id, started.elapsed().as_millis()); first_event = false; }
+                let output = if ctx.excel { translator.event(event.clone()) } else { Ok(vec![event.clone()]) };
+                if output.is_err() { capture_tool_failure(&app, &ctx, &event); eprintln!("bridge timing {} translation_failed_ms={} last_event={}", ctx.request_id, started.elapsed().as_millis(), last_event); }
                 let output = match output { Ok(v) => v, Err(e) => { lease.fail(e); eprintln!("bridge stream {} failed: {e}", ctx.request_id); yield Err(e); return; } };
                 for event in output {
                     terminal = matches!(event["type"].as_str(), Some("response.completed"|"response.failed"|"response.incomplete"));
-                    if terminal { lease.terminal(&event); }
+                    if terminal { lease.terminal(&event); eprintln!("bridge timing {} terminal_ms={} event={}", ctx.request_id, started.elapsed().as_millis(), event["type"]); }
                     if terminal && ctx.excel {
                         excel::history::save(&scope, &original_input, &event["response"]);
                         excel::cache_save(&scope, &translator.originals);
@@ -460,7 +558,7 @@ async fn open_events(
                 }
             }
         }
-        if !terminal { yield Err("upstream ended without a terminal event"); }
+        if !terminal { lease.fail("upstream ended without a terminal event"); eprintln!("bridge EOF {} elapsed_ms={} last_event={}", ctx.request_id, started.elapsed().as_millis(), last_event); yield Err("upstream ended without a terminal event"); }
     }))
 }
 /// 绑定未命中 key 的原生透传：无签名、无 Excel 转换、不占用 Excel 并发预算。
@@ -743,6 +841,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Arc::new(App {
         control: Arc::new(excel::control::Control::load(policy_path.into())?),
         secret,
+        clients: Mutex::new(BTreeMap::new()),
         config_path: std::env::var("EXCEL_BRIDGE_ACCOUNT_MAP")?,
         suffix: std::env::var("EXCEL_BRIDGE_MODEL_SUFFIX").unwrap_or_else(|_| "-excel".into()),
         allow_unsigned: std::env::var("EXCEL_BRIDGE_ALLOW_UNSIGNED")
@@ -784,9 +883,96 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod terminal_error_tests {
     use super::*;
     #[tokio::test]
+    async fn pooled_client_reuses_connection_and_does_not_bypass_changed_routes() {
+        use axum::extract::ConnectInfo;
+        use std::net::SocketAddr;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route(
+                        "/",
+                        get(|ConnectInfo(peer): ConnectInfo<SocketAddr>| async move {
+                            peer.to_string()
+                        }),
+                    )
+                    .into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let root = std::env::temp_dir().join(format!("excel-client-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let config_path = root.join("accounts.json");
+        std::fs::write(
+            &config_path,
+            r#"{"accounts":{"test":{"proxy":null,"direct":true}}}"#,
+        )
+        .unwrap();
+        let app = App {
+            secret: vec![0; 32],
+            config_path: config_path.to_str().unwrap().into(),
+            control: Arc::new(excel::control::Control::load(root.join("policy.json")).unwrap()),
+            suffix: "-excel".into(),
+            allow_unsigned: false,
+            clients: Mutex::new(BTreeMap::new()),
+        };
+        let ctx = Context {
+            account: "test".into(),
+            scope: "test".into(),
+            request_id: "test".into(),
+            excel: true,
+            key: None,
+            expires: 0,
+        };
+        let url = format!("http://{address}/");
+        let first = client(&app, &ctx)
+            .unwrap()
+            .get(&url)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let second = client(&app, &ctx)
+            .unwrap()
+            .get(&url)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(
+            first, second,
+            "sequential requests must reuse the TCP connection"
+        );
+        std::fs::write(
+            &config_path,
+            r#"{"accounts":{"test":{"proxy":null,"direct":false}}}"#,
+        )
+        .unwrap();
+        assert!(
+            client(&app, &ctx).is_err(),
+            "changed invalid route must not reuse direct client"
+        );
+        std::fs::write(&config_path, r#"{"accounts":{}}"#).unwrap();
+        assert!(
+            client(&app, &ctx).is_err(),
+            "revoked account must not reuse pooled client"
+        );
+        server.abort();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
     async fn partial_response_gets_failed_terminal_without_success_or_payload_leak() {
         let events: Events = Box::pin(futures_util::stream::iter(vec![
-            Ok(json!({"type":"response.created","sequence_number":3,"response":{"id":"resp_test"}})),
+            Ok(
+                json!({"type":"response.created","sequence_number":3,"response":{"id":"resp_test"}}),
+            ),
             Err("invalid tool transport envelope"),
         ]));
         let output: Vec<_> = terminal_errors(events).collect().await;
