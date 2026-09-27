@@ -21,6 +21,8 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+mod request_body;
+
 type Events = Pin<Box<dyn Stream<Item = Result<Value, &'static str>> + Send>>;
 type Failure = (StatusCode, axum::Json<Value>);
 #[derive(Clone, Deserialize)]
@@ -148,6 +150,7 @@ fn upstream_headers(incoming: &HeaderMap, is_excel: bool) -> Result<HeaderMap, F
                 n,
                 "host"
                     | "content-length"
+                    | "content-encoding"
                     | "connection"
                     | "upgrade"
                     | "transfer-encoding"
@@ -433,7 +436,7 @@ async fn unsigned_events(
     if let Some(object) = source.as_object_mut() {
         object.insert("model".into(), json!(model));
         object.remove("type");
-        object["stream"] = json!(true);
+        object.insert("stream".into(), json!(true));
     }
     let request_id = uuid::Uuid::new_v4().to_string();
     let account_id = headers
@@ -509,8 +512,12 @@ async fn http(
     body: Bytes,
 ) -> Result<Response, Failure> {
     let identity = context(&headers, &app)?;
-    let source: Value = serde_json::from_slice(&body)
-        .map_err(|_| fail(StatusCode::BAD_REQUEST, "invalid JSON request"))?;
+    let decode_headers = headers.clone();
+    let source = tokio::task::spawn_blocking(move || {
+        request_body::parse(&decode_headers, &body, request_body::MAX_BODY_BYTES)
+    })
+    .await
+    .map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "request decoding failed"))??;
     let mut stream = events(app, identity, headers, source).await?;
     let bytes = async_stream::stream! {
         while let Some(event) = stream.next().await {
@@ -692,7 +699,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/healthz", get(|| async { StatusCode::NO_CONTENT }))
         .route("/_control/{operation}", post(control))
         .route("/backend-api/codex/responses", post(http).get(ws))
-        .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(request_body::MAX_BODY_BYTES))
         .with_state(app);
     let listener = tokio::net::TcpListener::bind(
         std::env::var("EXCEL_BRIDGE_LISTEN").unwrap_or_else(|_| "127.0.0.1:8089".into()),
