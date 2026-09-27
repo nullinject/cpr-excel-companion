@@ -42,6 +42,18 @@
 
 `excelMode` 三种取值：`suffix`（按后缀判定）、`always`（命中绑定即 Excel，适合绑定基础模型名让客户端无感）、`never`（命中绑定也原生，预留）。
 
+## 模型通道（按基础模型名的三态开关）
+
+网关设置页对**基础模型名**（不带后缀）设置通道，三态语义：
+
+| 状态 | 无后缀请求 | 带 `-excel` 后缀请求 |
+| --- | --- | --- |
+| 跟随后缀（默认） | 原生 | Excel |
+| Excel | **强制 Excel** | Excel |
+| 原生 | 原生 | **强制原生** |
+
+"Excel" 态意味着客户端无需改模型名即可走 Excel；"原生" 态优先级高于后缀，客户端带后缀也会被压回。存储在桥接策略的 `model_channels`，侧栏保存即时生效。
+
 ## 验证记录（2026-09-27，生产实测）
 
 原生透传（gpt-5.6-sol，13 input tokens）、Excel 非流式（gpt-5.6-sol/terra-excel，22356 input = BPS 固定前缀）、Excel 流式（gpt-6-astra-excel，SSE + [DONE]）、WebSocket 上游传输、CPR `model_requests` 用量与计费、侧边栏观察归并（真实 Key ID、上游模型、错误码）全部通过。

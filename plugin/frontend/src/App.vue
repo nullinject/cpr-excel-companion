@@ -86,10 +86,6 @@ const accountList = computed(() => {
   for (const id of policy.value?.accounts.deny ?? []) if (!map.has(id)) map.set(id, true)
   return [...map.entries()].map(([id, enabled]) => ({ id, enabled }))
 })
-function channelTextOf(model: string): string {
-  const state = modelState(model)
-  return state === 'excel' ? 'Excel' : state === 'native' ? '原生' : '跟随后缀'
-}
 function accountAllowed(id: string): boolean {
   const p = policy.value
   if (!p) return true
