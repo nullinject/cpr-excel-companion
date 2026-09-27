@@ -3,7 +3,7 @@
   "name": "excel-companion",
   "publisher": "nullinject",
   "displayName": "Excel Companion",
-  "version": "0.6.2",
+  "version": "0.7.6",
   "description": "官方 CPR 的 Excel 桥接适配器（数据面桥接 + 进程内控制面）",
   "license": "Unlicense",
   "engines": {
@@ -14,6 +14,7 @@
   "contributes": {
     "middleware": {
       "stages": [
+        "request",
         "attempt"
       ],
       "inputFormats": [
@@ -45,16 +46,6 @@
         "minLength": 1,
         "maxLength": 256
       },
-      "excelEnabled": {
-        "type": "boolean",
-        "default": true
-      },
-      "excelModelSuffix": {
-        "type": "string",
-        "default": "-excel",
-        "minLength": 1,
-        "maxLength": 64
-      },
       "bridgeControlUrl": {
         "type": "string",
         "default": "http://127.0.0.1:8089/_control"
@@ -62,16 +53,6 @@
       "showPage": {
         "type": "boolean",
         "default": true
-      },
-      "excelMode": {
-        "type": "string",
-        "enum": [
-          "suffix",
-          "always",
-          "never"
-        ],
-        "default": "suffix",
-        "description": "suffix=按模型后缀；always=命中绑定即 Excel；never=命中绑定也原生"
       }
     },
     "additionalProperties": false,
