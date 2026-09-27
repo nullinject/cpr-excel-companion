@@ -20,8 +20,13 @@ CPR 的 Codex HTTP 上游会发送 `Content-Encoding: zstd`。此前桥接直接
 - 补齐原项目工具封装的兼容解码，保留已声明工具校验；流解析或工具转换失败时发送失败终态并保留原因，避免无原因断流。
 - 官方 CPR 3.16.0 部署必须保持 `openai.ws_pool.enabled: true`。关闭连接池会让 Codex 的首次 WebSocket 请求就收到 `previous_response_not_found` / `pool_unavailable`，随后反复重试和回退；普通 HTTP 探活无法发现此问题。
 - 插件仅绑定 `attempt` 和观察事件。官方 3.16.0 的 `request` 中间件 WebSocket 帧投影会导致 `request middleware returned an invalid response`；旧安装需移除该 request 绑定。该阶段也未提供客户端 Key，移除不会损失可用的身份信息。
+- 账户并发占满时应配置 CPR 原生 `maxWaitingPerAccount` / `concurrencyWaitTimeoutSeconds`。桥接排队发生在宿主账户选择之后，无法兜底宿主提前返回的 503；本次线上使用等待上限 8、超时 120 秒，账户并发上限仍为 3。按自己的负载调整。
 - 不要在账户凭据 JSON 中添加 `websockets` 字段：3.16.0 拒绝未知字段，导致凭据解析失败和 503。通过官方账户设置管理传输方式。
 - 原生 HTTP 上游不接受 `generate=false`，因此 Excel 预热在本地完成，不能简单改走原生 HTTP。
+
+### 真实 Codex 验收（2026-09-27）
+
+Codex Desktop CLI 0.158.0-alpha.2.1 使用真实 Key，各模型 3 轮：创建文件、执行测试、`exec resume` 续接、修改代码、再次测试和回忆前文标记。Sol 三轮全部完成且零重连；Astra 三轮完成，但第一轮发生 TLS 握手 EOF 重试，用时约 293 秒，后两轮正常。因此本版本不能承诺没有传输错误。此前 180 秒超时及账户并发 3/3 引起的 503 也保留为失败证据，不以最终成功抹除。
 
 ## 工作方式
 
