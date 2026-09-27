@@ -6,7 +6,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
@@ -39,6 +39,9 @@ struct Record {
     source: &'static str,
     /// 该请求最终是否走 Excel 通道。
     excel: bool,
+    /// 签名请求携带的 key 摘要；用于观察归并时学习 hash → key ID。
+    #[serde(skip_serializing)]
+    key_hash: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -51,6 +54,8 @@ struct Inner {
     gate: Arc<Gate>,
     active: BTreeSet<String>,
     records: VecDeque<Record>,
+    /// 学到的 key 摘要 → CPR key ID（来自观察归并），用于解析按 Key 规则。
+    key_map: BTreeMap<String, String>,
 }
 pub struct Control {
     inner: Mutex<Inner>,
@@ -73,6 +78,7 @@ impl Control {
                 gate,
                 active: BTreeSet::new(),
                 records: VecDeque::new(),
+                key_map: BTreeMap::new(),
             }),
             path,
         })
@@ -184,6 +190,7 @@ impl Control {
                 error_code: None,
                 source: "bridge",
                 excel,
+                key_hash: ctx.key.clone(),
             });
             while i.records.len() > 1000 {
                 i.records.pop_back();
@@ -250,6 +257,7 @@ impl Control {
             error_code: None,
             source: "unsigned",
             excel: false,
+            key_hash: None,
         });
         while i.records.len() > 1000 {
             i.records.pop_back();
@@ -311,7 +319,15 @@ impl Control {
                     row.error = Some(format!("upstream status {status}"));
                 }
             }
+            let learn = row
+                .key_hash
+                .as_ref()
+                .zip(observation.client_key_id.as_ref())
+                .map(|(hash, key_id)| (hash.clone(), key_id.clone()));
             row.finished_at_ms = Some(observation.completed_at_ms);
+            if let Some((hash, key_id)) = learn {
+                i.key_map.insert(hash, key_id);
+            }
             return;
         }
         if !excel_requested || !i.saved.policy.enabled {
@@ -341,6 +357,7 @@ impl Control {
                 .and_then(|f| f.upstream_status_code.map(|s| format!("upstream status {s}"))),
             upstream_model: observation.upstream_model.clone(),
             excel: true,
+            key_hash: None,
             error_code: observation
                 .terminal
                 .as_ref()
@@ -447,6 +464,7 @@ mod tests {
             scope: "k".into(),
             request_id: "r1".into(),
             excel: true,
+            key: None,
             expires: 1,
         };
         let first = c.enter(&ctx, "model", "-excel").await;

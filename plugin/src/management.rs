@@ -39,6 +39,7 @@ pub async fn remote(
         scope: hex::encode(hash.finalize()),
         request_id: id.into(),
         excel: false,
+        key: None,
         expires: now + 30,
     };
     let token = sign(&context, secret).map_err(fault)?;

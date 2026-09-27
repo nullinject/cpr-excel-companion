@@ -43,6 +43,14 @@ pub enum Channel {
 /// Excel = 无后缀请求也强制走 Excel（仅签名请求）；Native = 带 -excel 后缀也压回原生。
 pub type ModelChannels = BTreeMap<String, Channel>;
 
+/// 单个 Key 的模型通道覆盖；优先级高于全局 model_channels。
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyRule {
+    #[serde(default)]
+    pub models: BTreeMap<String, Channel>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Policy {
@@ -52,6 +60,9 @@ pub struct Policy {
     pub client_keys: Scope,
     #[serde(default)]
     pub model_channels: ModelChannels,
+    /// 按 Key 的模型通道覆盖，键为 CPR 的 client key ID。
+    #[serde(default)]
+    pub key_rules: BTreeMap<String, KeyRule>,
     pub concurrency: usize,
     pub overflow: Overflow,
     pub queue_capacity: usize,
@@ -65,6 +76,7 @@ impl Default for Policy {
             accounts: Scope::default(),
             client_keys: Scope::default(),
             model_channels: BTreeMap::new(),
+            key_rules: BTreeMap::new(),
             concurrency: 1,
             overflow: Overflow::Queue,
             queue_capacity: 32,
@@ -89,6 +101,16 @@ impl Policy {
             })
         {
             return Err("model_channels supports at most 200 models of 1 to 256 bytes");
+        }
+        if self.key_rules.len() > 256
+            || self.key_rules.iter().any(|(key, rule)| {
+                key.is_empty()
+                    || key.len() > 256
+                    || rule.models.len() > 200
+                    || rule.models.keys().any(|m| m.is_empty() || m.len() > 256)
+            })
+        {
+            return Err("key_rules supports at most 256 keys of 200 models each");
         }
         for scope in [&self.models, &self.accounts, &self.client_keys] {
             if scope.allow.len() + scope.deny.len() > 200

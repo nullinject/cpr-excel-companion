@@ -11,6 +11,10 @@ pub struct Context {
     pub scope: String,
     pub request_id: String,
     pub excel: bool,
+    /// 客户端 API key 的 sha256 摘要（request 阶段提取，随签名保护传输）；
+    /// 桥接据此应用按 Key 的模型通道规则。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
     pub expires: u64,
 }
 
@@ -69,6 +73,7 @@ mod tests {
             scope: "tenant-a".into(),
             request_id: "req-test".into(),
             excel: true,
+            key: None,
             expires: 150,
         };
         let token = sign(&context, secret).unwrap();
