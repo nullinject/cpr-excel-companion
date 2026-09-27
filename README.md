@@ -1,6 +1,6 @@
 # CPR Excel Companion
 
-**v0.8.3：官方 CPR 3.16.0 插件 + 独立桥接服务。数据面经 CPR 原生 Provider 执行，保留计费与用量统计链路；验收范围和已知限制见下文。**
+**v0.8.4：官方 CPR 3.16.0 插件 + 独立桥接服务。数据面经 CPR 原生 Provider 执行，保留计费与用量统计链路；验收范围和已知限制见下文。**
 
 协议转换移植自 [Kaixxrua/excel-codex-bridge](https://github.com/Kaixxrua/excel-codex-bridge)。无需修改 CPR 源码；由插件、桥接服务与上游路由三部分组成。
 
@@ -13,6 +13,14 @@ CPR 的 Codex HTTP 上游会发送 `Content-Encoding: zstd`。此前桥接直接
 同时修复未签名透传请求缺省 `stream` 字段时发生 panic、导致连接中断的问题。
 
 本修复需要更新并重启**桥接服务二进制**；仅更新 CPR 侧插件不会修复旧桥接。回归测试包含真实 HTTP 监听器下未签名、签名原生、签名 Excel 三条路径，不会请求真实上游。
+
+## v0.8.4：Codex exec 内部工具路由
+
+- 修复已在 `functions.exec` 描述中显式声明的内部对象参数 API（例如 `mcp__codex_app__list_threads`）被上游误放进外层 references 后触发 `upstream requested an undeclared tool` 的问题。
+- 顶层工具匹配仍优先。仅当本轮声明了 custom `functions.exec`，且其描述包含该 API 的精确 TypeScript 对象参数声明时，转换成同一个已声明 `functions.exec` 的 custom 调用；桥接不执行工具，不新增顶层权限。
+- 参数通过 JSON 字符串 + `JSON.parse` 传递，避免把引号、换行或 `__proto__` 当成 JavaScript 代码/原型设置。未知名称、仅在描述正文提及的名称、非法标识符、非对象参数和 `tool_choice=none` 仍拒绝。
+- 历史尾部补充顶层/内部工具的路由提示；工具名诊断只记录名称和有界目录样本，不记录参数、代码、请求正文或凭据。
+- 流式转换只输出一次 custom 调用，保留 call_id，并以原生 run_officejs 身份重放后续工具结果。没有加入自动重试，也不会执行重复调用。
 
 ## v0.8.3：工具中继与账户出口修复
 
