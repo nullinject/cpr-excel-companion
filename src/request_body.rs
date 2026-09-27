@@ -239,7 +239,7 @@ mod tests {
                         .unwrap();
                 let response = client
                     .post(&url)
-                    .headers(headers)
+                    .headers(headers.clone())
                     .body(warmup)
                     .send()
                     .await
@@ -254,6 +254,11 @@ mod tests {
                     .unwrap();
                 assert_eq!(terminal["response"]["usage"]["total_tokens"], 0);
                 assert_eq!(terminal["response"]["output"], serde_json::json!([]));
+                source["previous_response_id"] = serde_json::json!("resp_missing_http_test");
+                let missing = zstd::stream::encode_all(serde_json::to_vec(&source).unwrap().as_slice(), 3).unwrap();
+                let response = client.post(&url).headers(headers).body(missing).send().await.unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                assert_eq!(response.json::<Value>().await.unwrap()["error"]["code"], "previous_response_not_found");
             }
         }
         server.abort();

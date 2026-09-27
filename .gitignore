@@ -8,3 +8,6 @@
 .env.*
 *.local.json
 .DS_Store
+/target-x86_64/
+/plugin/dist-*/
+**/__pycache__/

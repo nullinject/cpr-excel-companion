@@ -30,6 +30,8 @@ type Failure = (StatusCode, axum::Json<Value>);
 struct Account {
     proxy: Option<String>,
     direct: bool,
+    #[serde(default)]
+    upstream_account_id: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -48,10 +50,51 @@ struct App {
     clients: Mutex<BTreeMap<String, (Account, reqwest::Client)>>,
 }
 fn fail(status: StatusCode, message: &'static str) -> Failure {
+    if matches!(message, excel::history::MISSING | excel::history::CACHE_LIMIT) {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error":{
+                "type":"invalid_request_error",
+                "code":"previous_response_not_found",
+                "param":"previous_response_id",
+                "message":message
+            }})),
+        );
+    }
     (
         status,
         axum::Json(json!({"error":{"type":"excel_bridge_error","message":message}})),
     )
+}
+#[cfg(test)]
+mod continuation_error_tests {
+    use super::*;
+    #[test]
+    fn cache_limit_requests_replay_without_losing_input() {
+        excel::history::save("limit-test-scope", &[json!({"role":"user","content":"prior"})],
+            &json!({"id":"resp_limit_test","status":"completed","output":[]}));
+        let mut source = json!({"previous_response_id":"resp_limit_test","input":"x".repeat(2 * 1024 * 1024)});
+        let original = source.clone();
+        let message = excel::history::restore("limit-test-scope", &mut source).unwrap_err();
+        assert_eq!(message, excel::history::CACHE_LIMIT);
+        let (status, body) = fail(StatusCode::BAD_REQUEST, message);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "previous_response_not_found");
+        assert_eq!(source, original);
+        source.as_object_mut().unwrap().remove("previous_response_id");
+        excel::history::restore("limit-test-scope", &mut source).unwrap();
+    }
+    #[test]
+    fn missing_continuation_has_standard_replay_code() {
+        let mut source = json!({"previous_response_id":"resp_missing_test","input":"next"});
+        let original = source.clone();
+        let error = excel::history::restore("missing-test-scope", &mut source).unwrap_err();
+        let (status, body) = fail(StatusCode::BAD_REQUEST, error);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "previous_response_not_found");
+        assert_eq!(body["error"]["param"], "previous_response_id");
+        assert_eq!(source, original);
+    }
 }
 /// 连接级身份：有签名为 Some(ctx)；无签名为 None（仅原生透传，见 App::allow_unsigned）。
 #[derive(Clone)]
@@ -91,16 +134,29 @@ fn client(app: &App, ctx: &Context) -> Result<reqwest::Client, Failure> {
 }
 fn unsigned_client(app: &App, account_id: Option<&str>) -> Result<reqwest::Client, Failure> {
     let config = read_config(app)?;
-    let route = account_id
-        .and_then(|id| config.accounts.get(id))
-        .or_else(|| config.accounts.values().next())
-        .ok_or_else(|| {
-            fail(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "account map has no accounts",
-            )
-        })?;
-    cached_client(app, account_id.unwrap_or("unsigned"), route)
+    let id = account_id.unwrap_or_default();
+    let route = unsigned_route(&config, Some(id))?;
+    cached_client(app, id, route)
+}
+fn unsigned_route<'a>(config: &'a Config, account_id: Option<&str>) -> Result<&'a Account, Failure> {
+    let id = account_id.filter(|id| !id.is_empty()).ok_or_else(|| {
+        fail(StatusCode::SERVICE_UNAVAILABLE, "upstream account identity required")
+    })?;
+    if let Some(route) = config.accounts.get(id) {
+        return Ok(route);
+    }
+    // CPR's account id and ChatGPT's account id are different namespaces.
+    // Resolve the latter explicitly; never guess another account's egress.
+    let mut matches = config.accounts.values().filter(|route| {
+        route.upstream_account_id.as_deref() == Some(id)
+    });
+    let route = matches.next().ok_or_else(|| {
+        fail(StatusCode::SERVICE_UNAVAILABLE, "upstream account is not mapped")
+    })?;
+    if matches.next().is_some() {
+        return Err(fail(StatusCode::SERVICE_UNAVAILABLE, "upstream account route is ambiguous"));
+    }
+    Ok(route)
 }
 fn read_config(app: &App) -> Result<Config, Failure> {
     let data = std::fs::read(&app.config_path).map_err(|_| {
@@ -982,5 +1038,41 @@ mod terminal_error_tests {
         assert_eq!(terminal["sequence_number"], 4);
         assert_eq!(terminal["response"]["id"], "resp_test");
         assert_eq!(terminal["response"]["error"]["message"], "invalid tool transport envelope");
+    }
+}
+
+#[cfg(test)]
+mod account_route_tests {
+    use super::*;
+
+    #[test]
+    fn unsigned_routing_matches_upstream_identity_and_rejects_ambiguity() {
+        let config: Config = serde_json::from_value(json!({"accounts":{
+            "acct_first":{"direct":true,"upstream_account_id":"upstream_first"},
+            "acct_second":{"direct":false,"proxy":"socks5h://127.0.0.1:1080","upstream_account_id":"upstream_second"}
+        }})).unwrap();
+        assert_eq!(unsigned_route(&config, Some("upstream_second")).unwrap().proxy.as_deref(), Some("socks5h://127.0.0.1:1080"));
+        assert!(unsigned_route(&config, Some("unknown")).is_err());
+        assert!(unsigned_route(&config, Some("")).is_err());
+        assert!(unsigned_route(&config, None).is_err());
+        let mut ambiguous = config;
+        ambiguous.accounts.get_mut("acct_first").unwrap().upstream_account_id = Some("upstream_second".into());
+        assert!(unsigned_route(&ambiguous, Some("upstream_second")).is_err());
+    }
+    #[tokio::test]
+    async fn unsigned_missing_identity_never_uses_first_account() {
+        let path = std::env::temp_dir().join(format!("excel-route-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&path, br#"{"accounts":{"acct_one":{"direct":true}}}"#).unwrap();
+        let app = App {
+            secret: vec![7; 32],
+            config_path: path.to_string_lossy().into_owned(),
+            control: Arc::new(excel::control::Control::load(path.with_extension("policy")).unwrap()),
+            suffix: "-excel".into(),
+            allow_unsigned: true,
+            clients: Mutex::new(BTreeMap::new()),
+        };
+        let result = unsigned_client(&app, None);
+        std::fs::remove_file(path).unwrap();
+        assert!(result.is_err(), "missing identity must never select the first account");
     }
 }

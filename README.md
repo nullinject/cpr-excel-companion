@@ -1,6 +1,6 @@
 # CPR Excel Companion
 
-**v0.8.2：官方 CPR 3.16.0 插件 + 独立桥接服务。数据面经 CPR 原生 Provider 执行，计费与用量统计完整；已在生产环境通过端到端验收（2026-09-27）。**
+**v0.8.3：官方 CPR 3.16.0 插件 + 独立桥接服务。数据面经 CPR 原生 Provider 执行，保留计费与用量统计链路；验收范围和已知限制见下文。**
 
 协议转换移植自 [Kaixxrua/excel-codex-bridge](https://github.com/Kaixxrua/excel-codex-bridge)。无需修改 CPR 源码；由插件、桥接服务与上游路由三部分组成。
 
@@ -13,6 +13,15 @@ CPR 的 Codex HTTP 上游会发送 `Content-Encoding: zstd`。此前桥接直接
 同时修复未签名透传请求缺省 `stream` 字段时发生 panic、导致连接中断的问题。
 
 本修复需要更新并重启**桥接服务二进制**；仅更新 CPR 侧插件不会修复旧桥接。回归测试包含真实 HTTP 监听器下未签名、签名原生、签名 Excel 三条路径，不会请求真实上游。
+
+## v0.8.3：工具中继与账户出口修复
+
+- 续接缓存过期、未命中或累计超过 2 MiB 时，HTTP / WebSocket 返回标准 `previous_response_not_found`（`param=previous_response_id`），由支持该协议的客户端移除旧 ID 并补发完整历史；桥接不会跨作用域取缓存、静默删历史或无限重试。
+- 2 MiB 仍是单条进程内缓存上限（最多 32 条、30 分钟），不是模型上下文上限。超过缓存预算的完整历史允许无状态预热/重放，正文仍受 32 MiB 请求上限约束；不扩大缓存，也不自动做摘要。
+- 新工具调用按 CPA 协议使用 references: [完整工具名]，code 仅承载 function 参数对象或 custom 原文；仍校验工具已声明。兼容已有嵌套封装，包括旧版本的空 references。
+- 未命中插件绑定的原生请求不再借用第一个账户的代理。通过 chatgpt-account-id 精确匹配映射中的 upstream_account_id；缺失、未知或重复映射返回 503，绝不自动切换其他账户或直连。
+- 升级次序：先更新桥接二进制，再更新并运行 deploy/sync-account-map.py。同步只读取启用的 OpenAI 账户的 ID、上游账户 ID 与出口代理，不读取 OAuth 凭据。
+- 不修改官方 CPR 本体或账户传输设置；按 Key/账户组/模型筛选仍使用 CPR 原生插件绑定。代理不自动配置浏览器时区，本桥接没有浏览器运行时，不宣称仅凭代理就完成时区一致性验收。
 
 ## v0.8.2 桥接：真实 Codex 客户端兼容
 
@@ -118,7 +127,7 @@ Codex Desktop CLI 0.158.0-alpha.2.1 使用真实 Key，各模型 3 轮：创建�
 
 无代理账户显式写 `{"direct":true}`；缺失账户或矛盾配置拒绝请求，不自动直连。更新映射用原子替换，且**挂载目录而非单文件**（rename 替换会使单文件 bind mount 失效）。
 
-桥接端点：`GET /healthz`、`POST/WS /backend-api/codex/responses`、`POST /_control/{snapshot|policy|observe}`，均要求签名。
+桥接端点：`GET /healthz`、`POST/WS /backend-api/codex/responses`、`POST /_control/{snapshot|policy|observe}`，控制端点要求逐请求签名；healthz 为公开存活检查，生成端点可允许未签名原生透传（不允许 Excel 转换）。
 
 ### CPR 插件配置
 
@@ -147,7 +156,7 @@ pnpm lint
 
 Rust 1.97.1，Node >=24 / pnpm 12.6.0。打包：官方 `cpr-plugin package --manifest plugin/plugin.json --binary target/release/cpr-excel-companion-plugin --target x86_64-unknown-linux-gnu --resource-map web=frontend/dist --output-dir plugin/dist`（CLI 与 vendored SDK 同为 v3.16.0 提交 0534dd8）。
 
-不记录请求正文、文件内容或令牌；拒绝远程图片 URL；内联附件有大小限制。未包含原项目的登录发现功能或 OfficeJS 执行器。
+默认不记录请求正文、文件内容或令牌；上游的可选短时工具失败诊断会将有限工具事件写入私有文件，仅在操作员显式配置后生效。拒绝远程图片 URL；内联附件有大小限制。未包含原项目的登录发现功能或 OfficeJS 执行器。
 
 ## 致谢
 
