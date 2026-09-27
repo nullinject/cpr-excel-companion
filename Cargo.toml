@@ -1,6 +1,6 @@
 [package]
 name = "cpr-excel-companion"
-version = "0.8.3"
+version = "0.8.4"
 edition = "2024"
 license = "Unlicense"
 publish = false

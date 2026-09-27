@@ -247,6 +247,10 @@ pub fn prepare(source: &Value, original_calls: &BTreeMap<String, Value>) -> Resu
             }
         }
     }
+    if tools.get("functions.exec").is_some_and(|tool| tool.custom) {
+        input.push(json!({"type":"message","role":"developer","content":[{"type":"input_text","text":
+            "Tool routing reminder: APIs documented inside functions.exec (tools.* or mcp__* names) are NOT top-level client tools. Invoke them through outer run_officejs references=[\"functions.exec\"] with JavaScript code such as text(await tools.API_NAME({...}));. Outer references must use a top-level Catalog name. Do not repeat a tool call whose result is already in history."}]}));
+    }
     let mut result = json!({"model":model,"model_selection":"explicit","store":false,"stream":true,"input":input,"reasoning_effort":effort});
     result["context_management"] = json!([{"type":"compaction","compact_threshold":200000}]);
     result["metadata"] =
@@ -260,6 +264,37 @@ pub fn prepare(source: &Value, original_calls: &BTreeMap<String, Value>) -> Resu
 }
 
 mod tool_envelope;
+
+// Codex's exec description explicitly declares its nested tools. Only those
+// exact object-argument API declarations may be wrapped; this is not an alias
+// for arbitrary unknown tools, and the bridge never executes the generated JS.
+fn nested_exec_tool<'a>(name: &str, tools: &'a Tools) -> Option<&'a Tool> {
+    if name.is_empty() || name.len() > 160
+        || !name.bytes().enumerate().all(|(index, c)| c == b'_' || c.is_ascii_alphabetic() || (index > 0 && c.is_ascii_digit()))
+        || matches!(name, "constructor" | "prototype" | "__proto__")
+    {
+        return None;
+    }
+    let exec = tools.get("functions.exec").filter(|tool| tool.custom)?;
+    let description = exec.spec["description"].as_str()?;
+    let signature = format!("declare const tools: {{ {name}(args:");
+    let (_, remaining) = description.split_once(&signature)?;
+    remaining.trim_start().starts_with('{').then_some(exec)
+}
+
+fn function_payload(payload: &Value, direct: bool) -> Result<Value> {
+    let inner = if direct {
+        serde_json::from_str(payload.as_str().ok_or("function code must be text")?)
+            .map_err(|_| "invalid function arguments")?
+    } else {
+        match &payload["arguments"] {
+            Value::String(s) => serde_json::from_str(s).map_err(|_| "invalid inner arguments")?,
+            v => v.clone(),
+        }
+    };
+    if !inner.is_object() { return Err("function arguments must be an object"); }
+    Ok(inner)
+}
 
 pub fn restore_call(native: &Value, tools: &Tools) -> Result<Value> {
     if !matches!(
@@ -299,9 +334,26 @@ pub fn restore_call(native: &Value, tools: &Tools) -> Result<Value> {
             .ok_or("missing client tool name")?;
         (name.to_owned(), envelope)
     };
-    let tool = tools
-        .get(&tool_key)
-        .ok_or("upstream requested an undeclared tool")?;
+    let mut wrapped_input = None;
+    let selected = if let Some(tool) = tools.get(&tool_key) {
+        Some(tool)
+    } else if let Some(exec) = nested_exec_tool(&tool_key, tools) {
+        let inner = function_payload(&payload, direct_payload)?;
+        // Serialize data as a JSON string, not a JavaScript object literal:
+        // quotes/backticks/newlines stay data, and __proto__ stays an own key.
+        wrapped_input = Some(format!("text(await tools.{tool_key}(JSON.parse({})));", json!(inner.to_string())));
+        eprintln!("bridge nested tool routed {}", json!({"requested":tool_key,"wrapper":"functions.exec"}));
+        Some(exec)
+    } else { None };
+    let tool = selected.ok_or_else(|| {
+        // Names only: never log arguments, custom code, headers or credentials.
+        eprintln!("bridge undeclared tool {}", json!({
+            "requested": tool_key.chars().take(160).collect::<String>(),
+            "declared_count": tools.len(),
+            "declared_sample": tools.keys().take(16).map(|key| key.chars().take(160).collect::<String>()).collect::<Vec<_>>()
+        }));
+        "upstream requested an undeclared tool"
+    })?;
     let call_id = native["call_id"]
         .as_str()
         .filter(|s| !s.is_empty())
@@ -312,7 +364,9 @@ pub fn restore_call(native: &Value, tools: &Tools) -> Result<Value> {
     }
     if tool.custom {
         output["id"] = json!(format!("ctc_{}", &digest(call_id)[..40]));
-        output["input"] = if direct_payload {
+        output["input"] = if let Some(code) = wrapped_input {
+            json!(code)
+        } else if direct_payload {
             payload
         } else {
             payload["input"].clone()
@@ -321,22 +375,7 @@ pub fn restore_call(native: &Value, tools: &Tools) -> Result<Value> {
             return Err("custom input must be text");
         }
     } else {
-        let inner = if direct_payload {
-            serde_json::from_str(
-                payload
-                    .as_str()
-                    .ok_or("function code must be text")?,
-            )
-            .map_err(|_| "invalid function arguments")?
-        } else {
-            match &payload["arguments"] {
-                Value::String(s) => serde_json::from_str(s).map_err(|_| "invalid inner arguments")?,
-                v => v.clone(),
-            }
-        };
-        if !inner.is_object() {
-            return Err("function arguments must be an object");
-        }
+        let inner = function_payload(&payload, direct_payload)?;
         output["arguments"] = json!(inner.to_string());
     }
     Ok(output)
@@ -345,6 +384,89 @@ pub fn restore_call(native: &Value, tools: &Tools) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn exec_source() -> Value {
+        json!({"model":"gpt-6-sol-excel","input":"list chats","tools":[{
+            "type":"custom","name":"functions.exec",
+            "description":"JavaScript orchestration. exec tool declaration:\n```ts\ndeclare const tools: { mcp__codex_app__list_threads(args: { limit?: number; }): Promise<CallToolResult>; };\n```"
+        }]})
+    }
+    #[test]
+    fn declared_nested_exec_api_uses_declared_custom_wrapper() {
+        let source = exec_source();
+        let native = json!({"type":"function_call","id":"fc_nested","call_id":"call_nested","name":"run_officejs",
+            "arguments":json!({"references":["mcp__codex_app__list_threads"],"code":"{\"limit\":3}"}).to_string()});
+        let restored = restore_call(&native, &tool_catalog(&source)).unwrap();
+        assert_eq!(restored["type"], "custom_tool_call");
+        assert_eq!(restored["name"], "functions.exec");
+        assert_eq!(restored["call_id"], "call_nested");
+        assert_eq!(restored["input"], format!("text(await tools.mcp__codex_app__list_threads(JSON.parse({})));", json!("{\"limit\":3}")));
+    }
+    #[test]
+    fn nested_api_fallback_keeps_unknown_tools_and_disabled_exec_rejected() {
+        let mut source = exec_source();
+        for requested in ["mcp__codex_app__delete_everything", "mcp__codex_app__list_threads;evil()", "constructor"] {
+            let native = json!({"name":"run_officejs","call_id":"bad","arguments":json!({"references":[requested],"code":"{}"}).to_string()});
+            assert!(restore_call(&native, &tool_catalog(&source)).is_err());
+        }
+        source["tool_choice"] = json!("none");
+        let native = json!({"name":"run_officejs","call_id":"disabled","arguments":json!({"references":["mcp__codex_app__list_threads"],"code":"{}"}).to_string()});
+        assert!(restore_call(&native, &tool_catalog(&source)).is_err());
+    }
+    #[test]
+    fn nested_api_requires_explicit_signature_custom_exec_and_object_payload() {
+        let native = |code: &str| json!({"name":"run_officejs","call_id":"shape","arguments":json!({"references":["mcp__codex_app__list_threads"],"code":code}).to_string()});
+        let mut source = exec_source();
+        for code in ["[]", "null", "text(await tools.anything())"] {
+            assert!(restore_call(&native(code), &tool_catalog(&source)).is_err());
+        }
+        source["tools"][0]["description"] = json!("mcp__codex_app__list_threads is mentioned only in prose");
+        assert!(restore_call(&native("{}"), &tool_catalog(&source)).is_err());
+        source = exec_source();
+        source["tools"][0]["type"] = json!("function");
+        assert!(restore_call(&native("{}"), &tool_catalog(&source)).is_err());
+    }
+    #[test]
+    fn nested_wrapper_preserves_hostile_strings_and_own_proto_key_as_json_data() {
+        let payload = json!({"__proto__":{"polluted":true},"text":"\");globalThis.injected=true;//\n` ${value} \\ 你好"});
+        let native = json!({"name":"run_officejs","call_id":"escaping","arguments":json!({"references":["mcp__codex_app__list_threads"],"code":payload.to_string()}).to_string()});
+        let out = restore_call(&native, &tool_catalog(&exec_source())).unwrap();
+        let code = out["input"].as_str().unwrap();
+        let quoted = code.strip_prefix("text(await tools.mcp__codex_app__list_threads(JSON.parse(").unwrap().strip_suffix(")));").unwrap();
+        let serialized: String = serde_json::from_str(quoted).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&serialized).unwrap(), payload);
+    }
+    #[test]
+    fn top_level_tool_wins_and_namespaced_exec_retains_identity() {
+        let mut source = exec_source();
+        let native = json!({"name":"run_officejs","call_id":"identity","arguments":json!({"references":["mcp__codex_app__list_threads"],"code":"{}"}).to_string()});
+        source["tools"].as_array_mut().unwrap().push(json!({"type":"function","name":"mcp__codex_app__list_threads"}));
+        let out = restore_call(&native, &tool_catalog(&source)).unwrap();
+        assert_eq!(out["type"], "function_call");
+        assert_eq!(out["name"], "mcp__codex_app__list_threads");
+        source = exec_source();
+        let mut exec = source["tools"][0].clone();exec["name"] = json!("exec");
+        source["tools"] = json!([{"type":"namespace","name":"functions","tools":[exec]}]);
+        let out = restore_call(&native, &tool_catalog(&source)).unwrap();
+        assert_eq!(out["name"], "exec");
+        assert_eq!(out["namespace"], "functions");
+    }
+    #[test]
+    fn nested_tool_stream_emits_one_custom_call_and_preserves_original_history() {
+        let source = exec_source();
+        let native = json!({"type":"function_call","name":"run_officejs","call_id":"nested_stream","arguments":json!({"references":["mcp__codex_app__list_threads"],"code":"{}"}).to_string()});
+        let mut translator = stream::Translator::new(tool_catalog(&source));
+        let events = translator.event(json!({"type":"response.output_item.done","output_index":0,"item":native})).unwrap();
+        assert_eq!(events.iter().filter(|e| e["type"] == "response.output_item.done").count(), 1);
+        let terminal = translator.event(json!({"type":"response.completed","response":{"id":"resp_nested","output":[native]}})).unwrap();
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0]["response"]["output"][0]["type"], "custom_tool_call");
+        assert_eq!(translator.originals["nested_stream"], native);
+        let mut next = source.clone();
+        next["input"] = json!([terminal[0]["response"]["output"][0],{"type":"custom_tool_call_output","call_id":"nested_stream","output":"listed"}]);
+        let upstream = prepare(&next, &translator.originals).unwrap();
+        assert!(upstream["input"].as_array().unwrap().contains(&native));
+        assert!(upstream["input"].as_array().unwrap().last().unwrap()["content"][0]["text"].as_str().unwrap().contains("NOT top-level"));
+    }
     fn source() -> Value {
         json!({"model":"gpt-5.6-sol-excel","input":"hello","tools":[{"type":"function","name":"shell","parameters":{"type":"object"}}]})
     }
