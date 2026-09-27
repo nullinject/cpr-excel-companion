@@ -65,9 +65,16 @@ pub async fn handle(
     call: TypedCall<ManagementRequest>,
     url: &str,
     secret: &[u8],
+    plugin_info: &serde_json::Value,
 ) -> Result<TypedReply<ManagementResponse>, PluginFault> {
     if !call.request.query.is_empty() || call.payload.len() > 65536 {
         return Ok(reply(400, br#"{"error":"invalid request"}"#.to_vec()));
+    }
+    if call.request.method == "GET" && call.request.path == "api/plugin-info" {
+        return Ok(reply(
+            200,
+            serde_json::to_vec(plugin_info).unwrap_or_default(),
+        ));
     }
     if call.request.method == "GET" && call.request.path == "api/options" {
         let response = call
@@ -126,6 +133,12 @@ pub fn registration(show_page: bool) -> ManagementRegistration {
             ManagementRoute {
                 method: "GET".into(),
                 path: "api/options".into(),
+                request_content_types: vec![],
+                response_content_types: vec!["application/json".into()],
+            },
+            ManagementRoute {
+                method: "GET".into(),
+                path: "api/plugin-info".into(),
                 request_content_types: vec![],
                 response_content_types: vec!["application/json".into()],
             },

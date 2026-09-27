@@ -1,5 +1,6 @@
 //! 网关准入规则与有界 FIFO 等待。许可必须随响应流持有至结束或取消。
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::{
     collections::BTreeSet,
     sync::{
@@ -31,6 +32,17 @@ pub enum Overflow {
     Reject,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Channel {
+    Excel,
+    #[default]
+    Native,
+}
+/// 按基础模型名的通道覆盖；缺省跟随后缀语义。
+/// Excel = 无后缀请求也强制走 Excel（仅签名请求）；Native = 带 -excel 后缀也压回原生。
+pub type ModelChannels = BTreeMap<String, Channel>;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Policy {
@@ -38,6 +50,8 @@ pub struct Policy {
     pub models: Scope,
     pub accounts: Scope,
     pub client_keys: Scope,
+    #[serde(default)]
+    pub model_channels: ModelChannels,
     pub concurrency: usize,
     pub overflow: Overflow,
     pub queue_capacity: usize,
@@ -50,6 +64,7 @@ impl Default for Policy {
             models: Scope::default(),
             accounts: Scope::default(),
             client_keys: Scope::default(),
+            model_channels: BTreeMap::new(),
             concurrency: 1,
             overflow: Overflow::Queue,
             queue_capacity: 32,
@@ -67,6 +82,13 @@ impl Policy {
         }
         if !(1..=600_000).contains(&self.queue_timeout_ms) {
             return Err("queue_timeout_ms must be between 1 and 600000");
+        }
+        if self.model_channels.len() > 200
+            || self.model_channels.keys().any(|m| {
+                m.is_empty() || m.len() > 256 || m.trim() != m
+            })
+        {
+            return Err("model_channels supports at most 200 models of 1 to 256 bytes");
         }
         for scope in [&self.models, &self.accounts, &self.client_keys] {
             if scope.allow.len() + scope.deny.len() > 200
