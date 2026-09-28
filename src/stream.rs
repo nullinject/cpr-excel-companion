@@ -62,6 +62,40 @@ impl Decoder {
     }
 }
 
+/// Only fixed, known error codes leave the bridge; raw upstream error text may
+/// contain prompts or credentials. Preserve the classification so CPR can apply
+/// its existing recovery policy without retrying a partially delivered response.
+pub fn failure_details(event: &Value) -> (&'static str, &'static str, &'static str) {
+    let code = ["/response/error/code", "/error/code", "/code", "/response/error/type", "/error/type"]
+        .into_iter().find_map(|path| event.pointer(path).and_then(Value::as_str));
+    match code {
+        Some("rate_limit_exceeded") => ("rate_limit_exceeded", "rate_limit_error", "Excel upstream rate limit exceeded"),
+        Some("usage_limit_reached") => ("usage_limit_reached", "usage_limit_reached", "Excel upstream account usage limit reached"),
+        Some("insufficient_quota") => ("insufficient_quota", "insufficient_quota", "Excel upstream quota exhausted"),
+        Some("context_length_exceeded") => ("context_length_exceeded", "invalid_request_error", "Excel upstream context length exceeded; shorten or compact the conversation"),
+        Some("server_error") => ("server_error", "server_error", "Excel upstream server error"),
+        Some("internal_server_error") => ("internal_server_error", "server_error", "Excel upstream internal server error"),
+        Some("temporarily_unavailable") => ("temporarily_unavailable", "server_error", "Excel upstream temporarily unavailable"),
+        Some("overloaded") => ("overloaded", "server_error", "Excel upstream overloaded"),
+        Some("invalid_request_error") => ("invalid_request_error", "invalid_request_error", "Excel upstream rejected the request"),
+        Some("invalid_api_key") => ("invalid_api_key", "authentication_error", "Excel upstream authentication failed"),
+        Some("authentication_error") => ("authentication_error", "authentication_error", "Excel upstream authentication failed"),
+        Some("permission_denied") => ("permission_denied", "permission_error", "Excel upstream permission denied"),
+        Some("model_not_found") => ("model_not_found", "invalid_request_error", "Excel upstream model unavailable"),
+        _ => ("excel_upstream_failed", "server_error", "Excel upstream reported a failure (unclassified; see bridge event diagnostics)"),
+    }
+}
+pub fn incomplete_reason(event: &Value) -> &'static str {
+    match event.pointer("/response/incomplete_details/reason").and_then(Value::as_str) {
+        Some("max_output_tokens") => "max_output_tokens",
+        Some("content_filter") => "content_filter",
+        _ => "unknown",
+    }
+}
+pub fn is_terminal(event: &Value) -> bool {
+    matches!(event["type"].as_str(), Some("response.completed" | "response.failed" | "response.incomplete" | "error"))
+}
+
 pub struct Translator {
     tools: Tools,
     emitted: BTreeSet<String>,
@@ -69,6 +103,7 @@ pub struct Translator {
     pub terminal: bool,
     pub completed: Option<Value>,
     sequence: u64,
+    response_id: Option<String>,
 }
 impl Translator {
     pub fn new(tools: Tools) -> Self {
@@ -79,6 +114,7 @@ impl Translator {
             terminal: false,
             completed: None,
             sequence: 0,
+            response_id: None,
         }
     }
     fn tool_events(&mut self, native: &Value, index: Value) -> Result<Vec<Value>> {
@@ -119,13 +155,40 @@ impl Translator {
             .as_str()
             .ok_or("missing SSE event type")?
             .to_owned();
+        if let Some(id) = event.pointer("/response/id").and_then(Value::as_str) {
+            self.response_id = Some(id.to_owned());
+        }
         let mut out = match kind.as_str() {
             "error" | "response.failed" | "response.incomplete" => {
                 self.terminal = true;
-                // 不转发可能回显提示词或凭据的原始错误对象。
-                vec![
-                    json!({"type":"response.failed","response":{"id":event.pointer("/response/id").and_then(Value::as_str).unwrap_or("resp_excel_failed"),"object":"response","status":"failed","output":[],"error":{"code":"excel_upstream_failed","message":"Excel upstream did not complete the response"}}}),
-                ]
+                let incomplete = kind == "response.incomplete";
+                let id = self.response_id.as_deref().unwrap_or("resp_excel_failed");
+                let mut response = json!({"id":id,"object":"response",
+                    "status":if incomplete {"incomplete"} else {"failed"},"output":[]});
+                // Preserve protocol accounting and partial non-tool output, never
+                // turn unfinished tool arguments into an executable client call.
+                for field in ["model", "created_at", "usage"] {
+                    if let Some(value) = event["response"].get(field) {
+                        response[field] = value.clone();
+                    }
+                }
+                if let Some(items) = event.pointer("/response/output").and_then(Value::as_array) {
+                    response["output"] = json!(items.iter().filter(|item|
+                        matches!(item["type"].as_str(), Some("message" | "reasoning"))
+                    ).cloned().collect::<Vec<_>>());
+                }
+                if incomplete {
+                    response["error"] = Value::Null;
+                    response["incomplete_details"] = json!({"reason":incomplete_reason(&event)});
+                } else {
+                    let (code, error_type, message) = failure_details(&event);
+                    response["error"] = json!({"type":error_type,"code":code,"message":message});
+                }
+                let mut terminal = json!({"type":if incomplete {"response.incomplete"} else {"response.failed"},"response":response});
+                if let Some(status) = event["status"].as_u64().filter(|v| (400..=599).contains(v)) {
+                    terminal["status"] = json!(status);
+                }
+                vec![terminal]
             }
             "response.function_call_arguments.delta"
             | "response.function_call_arguments.done"
@@ -229,6 +292,67 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+    #[test]
+    fn failure_preserves_safe_code_usage_and_response_identity() {
+        let mut t = Translator::new(Tools::new());
+        let event = json!({"type":"response.failed","response":{
+            "id":"resp_rate","model":"gpt-test","status":"failed","output":[],
+            "usage":{"input_tokens":17,"output_tokens":2},
+            "error":{"code":"rate_limit_exceeded","message":"secret prompt or bearer token"}}});
+        let out = t.event(event).unwrap();
+        assert_eq!(out[0]["response"]["error"]["code"], "rate_limit_exceeded");
+        assert_eq!(out[0]["response"]["usage"]["input_tokens"],17);
+        assert_eq!(out[0]["response"]["id"],"resp_rate");
+        assert!(!out[0].to_string().contains("secret prompt"));
+    }
+    #[test]
+    fn incomplete_preserves_reason_and_partial_text_without_claiming_success() {
+        let mut t = Translator::new(Tools::new());
+        let event = json!({"type":"response.incomplete","response":{
+            "id":"resp_limit","status":"incomplete",
+            "output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"partial"}]}],
+            "incomplete_details":{"reason":"max_output_tokens"},
+            "usage":{"input_tokens":11,"output_tokens":64}}});
+        let out = t.event(event).unwrap();
+        assert_eq!(out[0]["type"], "response.incomplete");
+        assert_eq!(out[0]["response"]["status"], "incomplete");
+        assert_eq!(out[0]["response"]["incomplete_details"]["reason"], "max_output_tokens");
+        assert_eq!(out[0]["response"]["output"][0]["content"][0]["text"], "partial");
+        assert_eq!(out[0]["response"]["usage"]["output_tokens"],64);
+        assert!(t.terminal);
+        assert!(t.completed.is_none());
+    }
+    #[test]
+    fn failed_terminal_without_response_uses_started_response_id() {
+        let mut t = Translator::new(Tools::new());
+        t.event(json!({"type":"response.created","response":{"id":"resp_started","status":"in_progress"}})).unwrap();
+        let out=t.event(json!({"type":"error","error":{"code":"server_error","message":"private"}})).unwrap();
+        assert_eq!(out[0]["response"]["id"],"resp_started");
+    }
+    #[test]
+    fn failed_and_incomplete_never_emit_partial_tool_calls_or_raw_error_fields() {
+        for kind in ["response.failed", "response.incomplete"] {
+            let mut t = Translator::new(Tools::new());
+            let out=t.event(json!({"type":kind,"status":429,"message":"private_top",
+                "error":{"code":"sk-private-token","message":"private_error"},
+                "response":{"id":"resp_partial","status":"incomplete",
+                "incomplete_details":{"reason":"private_reason"},"metadata":{"private":"private_metadata"},
+                "output":[{"type":"function_call","name":"run_officejs","arguments":"{unfinished private_args"}]}})).unwrap();
+            assert_eq!(out.len(),1);
+            assert_eq!(out[0]["response"]["output"],json!([]));
+            assert!(!out[0].to_string().contains("private"));
+            assert_eq!(out[0]["status"],429);
+            assert!(t.originals.is_empty());
+            assert!(t.completed.is_none());
+        }
+    }
+    #[test]
+    fn top_level_error_type_is_classified_when_code_is_null() {
+        let event=json!({"type":"error","error":{"code":null,"type":"server_error","message":"private"}});
+        assert_eq!(failure_details(&event).0,"server_error");
+        assert!(is_terminal(&event));
+        assert!(!is_terminal(&json!({"type":"response.output_text.delta"})));
     }
     #[test]
     fn tool_call_is_emitted_once_and_preserves_original() {

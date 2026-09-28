@@ -18,6 +18,18 @@ CPR 的 Codex HTTP 上游会发送 `Content-Encoding: zstd`。此前桥接直接
 
 本修复需要更新并重启**桥接服务二进制**；仅更新 CPR 侧插件不会修复旧桥接。回归测试包含真实 HTTP 监听器下未签名、签名原生、签名 Excel 三条路径，不会请求真实上游。
 
+## 流式终态修复（本地已验证，待部署）
+
+原提示 “Excel upstream did not complete the response” 由桥接在收到上游 error、response.failed 或 response.incomplete 时统一生成，并不等同于一次 TCP 断线。旧逻辑丢弃了错误分类、未完成原因和终态 usage，无法据此判断线上是限流、上下文超限还是服务错误。
+
+- 对已知错误码保留分类，并生成固定脱敏说明；不转发原始错误正文、提示词或凭据。不认识的代码仍标为未分类，不能据此推断根因。
+- 保留 response.incomplete、max_output_tokens / content_filter 原因、已有文本和 usage；不伪造完成，也不把未完成工具参数发送成可执行调用。
+- 保留已创建的 response ID；有效终态后不再追加第二个失败；无终态 EOF 和截断 SSE 明确失败。原生链路的顶层 error 也作为终态处理。
+- 监控记录保留安全错误码及未完成原因，宿主没有新错误码时不清空已记录的原因；补充仅含事件类型、已知分类、耗时的日志，不记录请求正文或原始错误。
+- 未新增自动重放或换账号，避免部分输出或工具调用后的重复执行。认证、账户路由和并发限制不变。
+
+以上为普通回归测试验证，不是对线上错误率的保证。此修复涉及独立桥接二进制，仅升级 CPR 插件不能替换正在运行的旧 Bridge。
+
 ## v0.8.4：Codex exec 内部工具路由
 
 - 修复已在 `functions.exec` 描述中显式声明的内部对象参数 API（例如 `mcp__codex_app__list_threads`）被上游误放进外层 references 后触发 `upstream requested an undeclared tool` 的问题。

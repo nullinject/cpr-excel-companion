@@ -43,6 +43,24 @@ struct Record {
     #[serde(skip_serializing)]
     key_hash: Option<String>,
 }
+fn record_terminal(record: &mut Record, event: &Value) {
+    record.status = match event["type"].as_str() {
+        Some("response.completed") => "completed",
+        Some("response.incomplete") => "incomplete",
+        _ => "failed",
+    }.into();
+    record.usage = event["response"].get("usage").cloned();
+    record.finished_at_ms = Some(now());
+    if record.status == "incomplete" {
+        let reason=crate::stream::incomplete_reason(event);
+        record.error_code=Some(reason.into());
+        record.error=Some(format!("Excel upstream response incomplete: {reason}"));
+    } else if record.status == "failed" {
+        let (code,_,message)=crate::stream::failure_details(event);
+        record.error_code=Some(code.into());
+        record.error=Some(message.into());
+    }
+}
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Saved {
@@ -272,14 +290,7 @@ impl Control {
         });
     }
     pub fn finish_unsigned(&self, request_id: &str, event: &Value) {
-        self.update(request_id, |r| {
-            r.status = event["response"]["status"]
-                .as_str()
-                .unwrap_or("failed")
-                .into();
-            r.usage = event["response"].get("usage").cloned();
-            r.finished_at_ms = Some(now());
-        });
+        self.update(request_id, |r| record_terminal(r, event));
     }
     /// 合并宿主最终观察：真实 Key 身份、上游模型、终态与错误码。
     /// 观察有界且不重投；未知请求只接受带 -excel 后缀的模型（宿主侧已失败、未到桥接）。
@@ -307,13 +318,15 @@ impl Control {
             }
             if let Some(terminal) = &observation.terminal {
                 row.status = format!("{:?}", terminal.outcome).to_lowercase();
-                row.error_code = terminal.error_code.clone();
+                if terminal.error_code.is_some() {
+                    row.error_code = terminal.error_code.clone();
+                }
             }
             if let Some(failure) = &observation.failure {
                 if failure.error_code.is_some() {
                     row.error_code = failure.error_code.clone();
                 }
-                if let Some(status) = failure.upstream_status_code {
+                if let Some(status) = failure.upstream_status_code && row.error.is_none() {
                     row.error = Some(format!("upstream status {status}"));
                 }
             }
@@ -394,14 +407,7 @@ pub struct Lease {
 }
 impl Lease {
     pub fn terminal(&self, event: &Value) {
-        self.control.update(&self.id, |r| {
-            r.status = event["response"]["status"]
-                .as_str()
-                .unwrap_or("failed")
-                .into();
-            r.usage = event["response"].get("usage").cloned();
-            r.finished_at_ms = Some(now());
-        })
+        self.control.update(&self.id, |r| record_terminal(r, event));
     }
     pub fn failed(&self) {
         self.control.update(&self.id, |r| {
@@ -448,6 +454,35 @@ impl Drop for Lease {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn terminal_monitor_records_sanitized_failure_and_incomplete_reason() {
+        let path=std::env::temp_dir().join(format!("excel-terminal-{}",uuid::Uuid::new_v4()));
+        let c=Arc::new(Control::load(path).unwrap());
+        let ctx=Context { account:"a".into(),scope:"k".into(),request_id:"failed-test".into(),excel:false,key:None,expires:1 };
+        let lease=c.enter(&ctx,"test","-excel").await;
+        lease.terminal(&json!({"type":"response.failed","response":{"status":"failed","usage":{"input_tokens":7},"error":{"code":"rate_limit_exceeded","message":"private prompt secret"}}}));
+        let snapshot=c.snapshot();let record=&snapshot["records"][0];
+        assert_eq!(record["error_code"],"rate_limit_exceeded");
+        assert!(!record.to_string().contains("private prompt"));
+        assert_eq!(record["usage"]["input_tokens"],7);
+        let unsigned=c.enter_unsigned("incomplete-test","test",Some("a")).unwrap();
+        c.finish_unsigned("incomplete-test",&json!({"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}));
+        drop(unsigned);
+        let snapshot=c.snapshot();let record=&snapshot["records"][0];
+        assert_eq!(record["status"],"incomplete");
+        assert_eq!(record["error_code"],"max_output_tokens");
+        let observation=crate::observe::ObserveEvent {
+            event_id:"observation".into(),request_id:"failed-test".into(),client_key_id:None,
+            account_id:None,upstream_model:None,requested_model:None,completed_at_ms:1,
+            terminal:Some(crate::observe::Terminal { outcome:crate::observe::Outcome::Failed,error_code:None }),
+            failure:Some(crate::observe::Failure { error_code:None,upstream_status_code:Some(429),client_status_code:Some(429) }),usage:None,
+        };
+        c.observe(&observation,"-excel");
+        let snapshot=c.snapshot();let records=snapshot["records"].as_array().unwrap();
+        let record=records.iter().find(|r|r["request_id"]=="failed-test").unwrap();
+        assert_eq!(record["error_code"],"rate_limit_exceeded");
+        assert_eq!(record["error"],"Excel upstream rate limit exceeded");
+    }
     #[tokio::test]
     async fn policy_changes_wait_for_leases_and_cancelled_waiters_release_state() {
         let path = std::env::temp_dir().join(format!("excel-policy-{}", uuid::Uuid::new_v4()));
