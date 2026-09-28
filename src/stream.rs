@@ -81,6 +81,15 @@ pub fn failure_details(event: &Value) -> (&'static str, &'static str, &'static s
 
 fn known_failure(code: &str) -> Option<(&'static str, &'static str, &'static str)> {
     Some(match code {
+        // These are native Responses classifications, not transport failures.
+        // Keep safety decisions fatal and return fixed text, never raw upstream messages.
+        "cyber_policy" => ("cyber_policy", "invalid_request_error", "Excel upstream blocked this request under cyber policy"),
+        "bio_policy" => ("bio_policy", "invalid_request_error", "Excel upstream blocked this request under bio policy"),
+        "misalignment_policy_violation" => ("misalignment_policy_violation", "invalid_request_error", "Excel upstream blocked this request under misalignment policy"),
+        "invalid_prompt" => ("invalid_prompt", "invalid_request_error", "Excel upstream rejected the prompt"),
+        "content_filter" => ("content_filter", "invalid_request_error", "Excel upstream blocked this request under its content policy"),
+        "server_overloaded" => ("server_overloaded", "server_error", "Excel upstream overloaded"),
+        "usage_not_included" => ("usage_not_included", "usage_not_included", "Excel upstream usage is not included for this account"),
         "rate_limit_exceeded" | "rate_limit_error" => ("rate_limit_exceeded", "rate_limit_error", "Excel upstream rate limit exceeded"),
         "usage_limit_reached" => ("usage_limit_reached", "usage_limit_reached", "Excel upstream account usage limit reached"),
         "insufficient_quota" => ("insufficient_quota", "insufficient_quota", "Excel upstream quota exhausted"),

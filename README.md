@@ -23,6 +23,7 @@ CPR 的 Codex HTTP 上游会发送 `Content-Encoding: zstd`。此前桥接直接
 原提示 “Excel upstream did not complete the response” 由桥接在收到上游 error、response.failed 或 response.incomplete 时统一生成，并不等同于一次 TCP 断线。旧逻辑丢弃了错误分类、未完成原因和终态 usage，无法据此判断线上是限流、上下文超限还是服务错误。
 
 - 对已知错误码保留分类，并生成固定脱敏说明；不转发原始错误正文、提示词或凭据。不认识的代码仍标为未分类，不能据此推断根因。
+- 2026-09-28 热修复：保留 cyber_policy、bio_policy、misalignment_policy_violation、invalid_prompt、content_filter、server_overloaded、usage_not_included。策略错误继续失败关闭，不转换成成功，也不触发换账号或自动重放；cyber_policy 路径已用真实 Codex 0.157.1 配合同输入 SSE 探针验证：直接显示策略原因，不再因分类丢失误报断流并重连。其余新增映射由回归测试覆盖；历史未分类事件不能追溯判定为某一种策略错误。
 - 保留 response.incomplete、max_output_tokens / content_filter 原因、已有文本和 usage；不伪造完成，也不把未完成工具参数发送成可执行调用。
 - 保留已创建的 response ID；有效终态后不再追加第二个失败；无终态 EOF 和截断 SSE 明确失败。原生链路的顶层 error 也作为终态处理。
 - 监控记录保留安全错误码及未完成原因，宿主没有新错误码时不清空已记录的原因；补充仅含事件类型、已知分类、耗时的日志，不记录请求正文或原始错误。
