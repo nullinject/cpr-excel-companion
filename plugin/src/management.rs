@@ -111,13 +111,26 @@ pub async fn handle(
             serde_json::from_slice(&response.payload).map_err(|_| fault("invalid account list"))?;
         return Ok(reply(200,serde_json::to_vec(&json!({"keys":keys.keys,"accounts":accounts.accounts,"more":keys.next_cursor.is_some()||accounts.next_cursor.is_some()})).unwrap()));
     }
+    if call.request.method == "POST"
+        && matches!(call.request.path.as_str(), "api/keys" | "api/accounts")
+    {
+        let cursor = match catalog_cursor(&call.payload) {
+            Ok(cursor) => cursor,
+            Err(message) => return Ok(json_error(400, message)),
+        };
+        let page = catalog_page(&call.host, &call.request.path, cursor).await?;
+        return Ok(reply(
+            200,
+            serde_json::to_vec(&page).map_err(|_| fault("invalid catalog response"))?,
+        ));
+    }
     let (operation, payload) = match (call.request.method.as_str(), call.request.path.as_str()) {
         ("GET", "api/snapshot") if call.payload.is_empty() => ("snapshot", b"{}".to_vec()),
         ("POST", "api/policy") => ("policy", call.payload),
         ("POST", "api/observe") => ("observe", call.payload),
         _ => return Ok(reply(404, br#"{"error":"not found"}"#.to_vec())),
     };
-    let (status, payload) = remote(
+    let result = remote(
         &call.host,
         url,
         secret,
@@ -125,12 +138,88 @@ pub async fn handle(
         operation,
         payload,
     )
-    .await?;
-    Ok(reply(status, payload))
+    .await;
+    Ok(match result {
+        Ok((status, payload)) => reply(status, payload),
+        Err(_) => json_error(502, "无法连接桥接服务，请检查服务状态与控制地址。"),
+    })
 }
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogRequest {
+    cursor: Option<String>,
+}
+fn catalog_cursor(payload: &[u8]) -> Result<Option<String>, &'static str> {
+    let request: CatalogRequest =
+        serde_json::from_slice(payload).map_err(|_| "Invalid catalog request")?;
+    if request.cursor.as_ref().is_some_and(|cursor| {
+        cursor.is_empty() || cursor.len() > 4096
+    }) {
+        return Err("Invalid catalog cursor");
+    }
+    Ok(request.cursor)
+}
+fn json_error(status: u16, message: &str) -> TypedReply<ManagementResponse> {
+    reply(
+        status,
+        serde_json::to_vec(&json!({"error": message})).expect("JSON error message"),
+    )
+}
+// Only public catalog facts are returned. POST carries the opaque cursor as JSON.
+async fn catalog_page(
+    host: &HostClient,
+    path: &str,
+    cursor: Option<String>,
+) -> Result<serde_json::Value, PluginFault> {
+    if path == "api/keys" {
+        let response = host
+            .call(
+                "host.keys.list",
+                serde_json::to_value(KeyListRequest { cursor, limit: 200 })
+                    .map_err(|_| fault("invalid key cursor"))?,
+                vec![],
+            )
+            .await
+            .map_err(SessionError::into_plugin_fault)?;
+        let page: KeyListResult = serde_json::from_value(response.result)
+            .map_err(|_| fault("invalid key list"))?;
+        Ok(json!({"items": page.keys, "next_cursor": page.next_cursor}))
+    } else {
+        let query = gateway_plugin_sdk::call::data::AccountFactsQuery {
+            provider_id: Some("openai".into()),
+            cursor,
+            limit: 200,
+        };
+        let response = host
+            .call(
+                "host.data.accounts.list",
+                json!({}),
+                serde_json::to_vec(&query).map_err(|_| fault("invalid account cursor"))?,
+            )
+            .await
+            .map_err(SessionError::into_plugin_fault)?;
+        let page: gateway_plugin_sdk::call::data::AccountFactsPage =
+            serde_json::from_slice(&response.payload)
+                .map_err(|_| fault("invalid account list"))?;
+        Ok(json!({"items": page.accounts, "next_cursor": page.next_cursor}))
+    }
+}
+
 pub fn registration(show_page: bool) -> ManagementRegistration {
     ManagementRegistration {
         routes: vec![
+            ManagementRoute {
+                method: "POST".into(),
+                path: "api/keys".into(),
+                request_content_types: vec!["application/json".into()],
+                response_content_types: vec!["application/json".into()],
+            },
+            ManagementRoute {
+                method: "POST".into(),
+                path: "api/accounts".into(),
+                request_content_types: vec!["application/json".into()],
+                response_content_types: vec!["application/json".into()],
+            },
             ManagementRoute {
                 method: "GET".into(),
                 path: "api/options".into(),
@@ -181,5 +270,35 @@ pub fn registration(show_page: bool) -> ManagementRegistration {
             vec![]
         },
         callbacks: vec![],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn catalog_cursor_is_opaque_and_input_is_bounded() {
+        assert_eq!(catalog_cursor(br#"{"cursor":null}"#), Ok(None));
+        assert_eq!(
+            catalog_cursor(br#"{"cursor":"page-2_opaque"}"#),
+            Ok(Some("page-2_opaque".into()))
+        );
+        assert!(catalog_cursor(br#"{"cursor":"","limit":9999}"#).is_err());
+        let oversized = serde_json::to_vec(&json!({"cursor": "x".repeat(4097)})).unwrap();
+        assert!(catalog_cursor(&oversized).is_err());
+    }
+    #[test]
+    fn catalog_routes_are_read_only_and_keep_existing_routes() {
+        let registration = registration(true);
+        for path in ["api/keys", "api/accounts"] {
+            assert!(registration.routes.iter().any(|route| {
+                route.path == path && route.method == "POST"
+            }));
+        }
+        assert!(registration.routes.iter().any(|route| {
+            route.path == "api/options" && route.method == "GET"
+        }));
+        assert_eq!(registration.pages[0].id, "excel-gateway");
+        assert!(super::registration(false).pages.is_empty());
     }
 }
