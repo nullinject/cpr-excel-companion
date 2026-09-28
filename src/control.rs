@@ -106,6 +106,12 @@ impl Control {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+    pub fn normalize_user_prompt(&self) -> bool {
+        self.lock().saved.policy.normalize_user_prompt
+    }
+    pub fn retry_policy_errors(&self) -> bool {
+        self.lock().saved.policy.retry_policy_errors
+    }
     pub fn snapshot(&self) -> Value {
         let i = self.lock();
         json!({"policy":i.saved.policy,"version":i.saved.version,"active":i.gate.active(),"waiting":i.gate.waiting(),"records":i.records})

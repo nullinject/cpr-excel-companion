@@ -544,6 +544,10 @@ async fn open_events_at(
             return Err(fail(StatusCode::BAD_GATEWAY, "attachment upload failed"));
         }
         tools = excel::tool_catalog(&source);
+        if app.control.normalize_user_prompt() {
+            let applied = excel::prompt_normalization::apply(&mut source);
+            eprintln!("bridge prompt_normalization {} applied={} original_input_preserved=true", ctx.request_id, applied);
+        }
         body = match excel::prepare(&source, &excel::cache_load(&scope)) {
             Ok(body) => body,
             Err(e) => {
@@ -590,7 +594,7 @@ async fn open_events_at(
     let upstream_started = Instant::now();
     let response = match client
         .post(endpoint)
-        .headers(headers)
+        .headers(headers.clone())
         .json(&body)
         .send()
         .await
@@ -635,17 +639,19 @@ async fn open_events_at(
         upstream_started.elapsed().as_millis(),
         response.status().as_u16()
     );
+    let retry_enabled = ctx.excel && app.control.retry_policy_errors();
     let upstream_http_status = response.status().as_u16();
     let mut wire = response.bytes_stream();
     Ok(Box::pin(async_stream::stream! {
         let lease = lease;
         let mut decoder = excel::stream::Decoder::default();
-        let mut translator = excel::stream::Translator::new(tools);
+        let mut translator = excel::stream::Translator::new(tools.clone());
+        let mut retry = excel::stream::RejectionRetry::new(retry_enabled);
         let mut terminal = false;
         let mut first_event = true;
         let mut last_event = String::new();
         // 上游静默期插 SSE 注释保活：反代（Cloudflare ~100s 空闲超时）不会掐断长思考。
-        loop {
+        'upstream: loop {
             let chunk = match tokio::time::timeout(Duration::from_secs(15), wire.next()).await {
                 Ok(Some(Ok(c))) => c,
                 Ok(Some(Err(_))) => { lease.fail("upstream stream interrupted"); yield Err("upstream stream interrupted"); return; }
@@ -668,6 +674,33 @@ async fn open_events_at(
                     eprintln!("bridge upstream_terminal {} event={} code={} reason={} elapsed_ms={} error_fields={}",
                         ctx.request_id, last_event, code, excel::stream::incomplete_reason(&event), started.elapsed().as_millis(), excel::stream::failure_diagnostics(&event));
                 }
+                let events = match retry.event(event) {
+                    excel::stream::RetryDecision::Hold => continue,
+                    excel::stream::RetryDecision::Forward(events) => events,
+                    excel::stream::RetryDecision::Retry(original) => {
+                        let code = excel::stream::failure_details(original.last().unwrap()).0;
+                        let retry_number = retry.retries();
+                        eprintln!("bridge policy_retry {} code={} retry={}/{} same_request=true before_output=true", ctx.request_id, code, retry_number, excel::stream::MAX_POLICY_RETRIES);
+                        tokio::time::sleep(Duration::from_millis(500 * (1_u64 << (retry_number - 1)))).await;
+                        // Keep the same client/account/headers/body, and respect account revocation.
+                        let authorized = read_config(&app).is_ok_and(|config| config.accounts.contains_key(&ctx.account));
+                        if authorized {
+                            match client.post(endpoint).headers(headers.clone()).json(&body).send().await {
+                                Ok(response) if response.status().is_success() => {
+                                    wire = response.bytes_stream();
+                                    decoder = excel::stream::Decoder::default();
+                                    translator = excel::stream::Translator::new(tools.clone());
+                                    continue 'upstream;
+                                }
+                                _ => eprintln!("bridge policy_retry {} reopen_failed=true original_rejection_retained=true", ctx.request_id),
+                            }
+                        } else {
+                            eprintln!("bridge policy_retry {} account_unavailable=true original_rejection_retained=true", ctx.request_id);
+                        }
+                        original
+                    }
+                };
+                for event in events {
                 let output = if ctx.excel { translator.event(event.clone()) } else { Ok(vec![event.clone()]) };
                 if output.is_err() { capture_tool_failure(&app, &ctx, &event); eprintln!("bridge timing {} translation_failed_ms={} last_event={}", ctx.request_id, started.elapsed().as_millis(), last_event); }
                 let output = match output { Ok(v) => v, Err(e) => { lease.fail(e); eprintln!("bridge stream {} failed: {e}", ctx.request_id); yield Err(e); return; } };
@@ -687,6 +720,7 @@ async fn open_events_at(
                     }
                     yield Ok(event);
                     if terminal { return; }
+                }
                 }
             }
         }
@@ -1224,6 +1258,110 @@ mod account_route_tests {
     }
 }
 
+#[cfg(test)]
+mod policy_retry_http_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Mock {
+        requests: Mutex<Vec<(Vec<u8>, String)>>,
+        count: AtomicUsize,
+        first_has_output: bool,
+        successes_after: Option<usize>,
+        reopen_http_error: bool,
+    }
+    async fn serve_mock(State(state): State<Arc<Mock>>, headers: HeaderMap, body: Bytes) -> Response {
+        let count=state.count.fetch_add(1,Ordering::SeqCst)+1;
+        state.requests.lock().unwrap().push((body.to_vec(),headers.get("authorization").unwrap().to_str().unwrap().into()));
+        if count>1 && state.reopen_http_error { return StatusCode::SERVICE_UNAVAILABLE.into_response(); }
+        let id=format!("response_{count}");
+        let mut events=vec![json!({"type":"response.created","response":{"id":id,"status":"in_progress"}})];
+        if state.first_has_output {events.push(json!({"type":"response.output_text.delta","delta":"already delivered"}));}
+        if state.successes_after.is_some_and(|n|count>n) {
+            events.push(json!({"type":"response.completed","response":{"id":id,"status":"completed","output":[]}}));
+        } else {
+            events.push(json!({"type":"error","error":{"code":"cyber_policy","type":"invalid_prompt","message":"private fixture text"}}));
+        }
+        let wire=events.iter().flat_map(excel::stream::encode).collect::<Vec<_>>();
+        ([("content-type","text/event-stream")],wire).into_response()
+    }
+    async fn run_with_options(enabled:bool, normalize: bool, first_has_output:bool, successes_after:Option<usize>, reopen_http_error:bool) -> (Vec<Value>,Arc<Mock>,Value) {
+        let folder=std::env::temp_dir().join(format!("cpr-retry-http-{}",uuid::Uuid::new_v4()));std::fs::create_dir(&folder).unwrap();
+        let config=folder.join("accounts.json");std::fs::write(&config,json!({"accounts":{"fixture-account":{"proxy":null,"direct":true}}}).to_string()).unwrap();
+        let control=Arc::new(excel::control::Control::load(folder.join("policy.json")).unwrap());
+        control.save(excel::admission::Policy { enabled:true,retry_policy_errors:enabled,normalize_user_prompt:normalize,..Default::default() },Some(0)).unwrap();
+        let app=Arc::new(App { secret:b"fixture-signing-key-minimum-32-bytes".to_vec(),config_path:config.to_string_lossy().into(),control:control.clone(),suffix:"-excel".into(),allow_unsigned:false,clients:Mutex::new(BTreeMap::new()) });
+        let ctx=Context { account:"fixture-account".into(),scope:"fixture-scope".into(),request_id:uuid::Uuid::new_v4().to_string(),excel:true,key:None,expires:SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()+60 };
+        let token=excel::auth::sign(&ctx,&app.secret).unwrap();
+        let input=json!({"model":"gpt-test-excel","stream":true,"input":"Reply OK.","client_metadata":{"_cpr_excel_bridge":token}});
+        let mut headers=HeaderMap::new();headers.insert("authorization","Bearer fixture-only".parse().unwrap());
+        let state=Arc::new(Mock {requests:Mutex::new(Vec::new()),count:AtomicUsize::new(0),first_has_output,successes_after,reopen_http_error});
+        let router=Router::new().route("/responses",post(serve_mock)).with_state(state.clone());
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint: &'static str=Box::leak(format!("http://{}/responses",listener.local_addr().unwrap()).into_boxed_str());
+        let server=tokio::spawn(async move {axum::serve(listener,router).await.unwrap()});
+        let mut stream=open_events_at(app,Identity::Signed(Box::new(ctx)),headers,input,None,endpoint).await.unwrap();
+        let mut events=Vec::new();
+        while let Some(event)=stream.next().await {events.push(event.unwrap());}
+        drop(stream);server.abort();std::fs::remove_dir_all(folder).unwrap();
+        let snapshot=control.snapshot();
+        assert_eq!(snapshot["active"],0);
+        assert_eq!(events.iter().filter(|e|excel::stream::is_terminal(e)).count(),1);
+        assert!(!json!(events).to_string().contains("private fixture text"));
+        let requests=state.requests.lock().unwrap();
+        assert!(requests.iter().all(|r|r==&requests[0]),"retries must not rewrite body or change credentials");
+        drop(requests);
+        (events,state,snapshot)
+    }
+    async fn run(enabled:bool, first_has_output:bool, successes_after:Option<usize>, reopen_http_error:bool) -> (Vec<Value>,Arc<Mock>,Value) {
+        run_with_options(enabled, false, first_has_output, successes_after, reopen_http_error).await
+    }
+    #[tokio::test]
+    async fn disabled_returns_original_policy_without_retry() {
+        let (events,state,_)=run(false,false,None,false).await;
+        assert_eq!(state.count.load(Ordering::SeqCst),1);
+        assert_eq!(events.last().unwrap()["response"]["error"]["code"],"cyber_policy");
+    }
+    #[tokio::test]
+    async fn enabled_stops_after_five_retries_and_returns_policy() {
+        let (events,state,snapshot)=run(true,false,None,false).await;
+        assert_eq!(state.count.load(Ordering::SeqCst),6);
+        assert_eq!(events[0]["response"]["id"],"response_6");
+        assert_eq!(events.last().unwrap()["response"]["error"]["code"],"cyber_policy");
+        assert_eq!(snapshot["records"][0]["error_code"],"cyber_policy");
+    }
+    #[tokio::test]
+    async fn retry_success_exposes_only_the_successful_response() {
+        let (events,state,_)=run(true,false,Some(1),false).await;
+        assert_eq!(state.count.load(Ordering::SeqCst),2);
+        assert_eq!(events[0]["response"]["id"],"response_2");
+        assert_eq!(events.last().unwrap()["type"],"response.completed");
+    }
+    #[tokio::test]
+    async fn normalize_prompt_is_applied_to_the_actual_excel_request_body() {
+        let (_, state, _) = run_with_options(true, true, false, Some(1), false).await;
+        let requests = state.requests.lock().unwrap();
+        let body: Value = serde_json::from_slice(&requests[0].0).unwrap();
+        let text = body.pointer("/input/1/content/0/text").and_then(Value::as_str).unwrap();
+        assert!(text.starts_with(excel::prompt_normalization::PREFACE));
+        assert!(text.ends_with("Reply OK."));
+        assert_eq!(requests.len(), 2);
+    }
+    #[tokio::test]
+    async fn delivered_output_prevents_retry_even_when_enabled() {
+        let (events,state,_)=run(true,true,None,false).await;
+        assert_eq!(state.count.load(Ordering::SeqCst),1);
+        assert!(events.iter().any(|e|e["delta"]=="already delivered"));
+        assert_eq!(events.last().unwrap()["type"],"response.failed");
+    }
+    #[tokio::test]
+    async fn reopen_transport_failure_preserves_original_policy() {
+        let (events,state,_)=run(true,false,None,true).await;
+        assert_eq!(state.count.load(Ordering::SeqCst),2);
+        assert_eq!(events[0]["response"]["id"],"response_1");
+        assert_eq!(events.last().unwrap()["response"]["error"]["code"],"cyber_policy");
+    }
+}
 
 #[cfg(test)]
 mod complete_error_record_tests {

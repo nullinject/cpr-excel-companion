@@ -67,6 +67,12 @@ pub struct Policy {
     pub overflow: Overflow,
     pub queue_capacity: usize,
     pub queue_timeout_ms: u64,
+    /// Same-account, identical-request recheck up to five times, before output/usage.
+    #[serde(default)]
+    pub retry_policy_errors: bool,
+    /// Opt-in, intent-preserving structure instruction; never a policy-triggered rewrite.
+    #[serde(default)]
+    pub normalize_user_prompt: bool,
 }
 impl Default for Policy {
     fn default() -> Self {
@@ -81,6 +87,8 @@ impl Default for Policy {
             overflow: Overflow::Queue,
             queue_capacity: 32,
             queue_timeout_ms: 120_000,
+            retry_policy_errors: false,
+            normalize_user_prompt: false,
         }
     }
 }
