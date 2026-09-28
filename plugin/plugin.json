@@ -3,7 +3,7 @@
   "name": "excel-companion",
   "publisher": "nullinject",
   "displayName": "Excel Companion",
-  "version": "0.8.6",
+  "version": "0.8.7",
   "description": "Excel 通道适配插件。日常监控与路由设置请进入侧栏「Excel 网关」；此处只配置宿主连接。",
   "license": "Unlicense",
   "engines": {

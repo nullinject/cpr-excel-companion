@@ -182,7 +182,7 @@ dependencies = [
 
 [[package]]
 name = "cpr-excel-companion-plugin"
-version = "0.8.6"
+version = "0.8.7"
 dependencies = [
  "cpr-excel-companion",
  "gateway-plugin-sdk",

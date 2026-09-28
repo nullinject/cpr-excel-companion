@@ -51,7 +51,11 @@ export interface RequestRow {
   started_at_ms: number
   queue_ms: number | null
   finished_at_ms: number | null
-  usage: { input_tokens?: number, output_tokens?: number } | null
+  usage: {
+    input_tokens?: number | null
+    output_tokens?: number | null
+    timings?: { first_token_ms?: number | null, latency_ms?: number | null } | null
+  } | null
   error: string | null
   error_code: string | null
   upstream_model: string | null
@@ -152,4 +156,18 @@ export function formatDuration(ms: number | null) {
   return ms < 1000
     ? `${Math.round(ms)} ms`
     : `${(ms / 1000).toFixed(ms < 10000 ? 1 : 0)} s`
+}
+
+export function formatTokens(value: number | null | undefined) {
+  return value == null ? '—' : value.toLocaleString('zh-CN')
+}
+
+// 分子、分母均使用同一条宿主用量观察；不把整段请求耗时当生成耗时。
+export function tokensPerSecond(usage: RequestRow['usage']) {
+  const output = usage?.output_tokens
+  const first = usage?.timings?.first_token_ms
+  const completed = usage?.timings?.latency_ms
+  if (output == null || first == null || completed == null || completed <= first)
+    return null
+  return output * 1000 / (completed - first)
 }

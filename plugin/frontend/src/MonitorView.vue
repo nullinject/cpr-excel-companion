@@ -2,7 +2,7 @@
 import type { ClientKey, RequestRow, Snapshot } from './gateway'
 import { ChevronLeft, ChevronRight, Search } from '@lucide/vue'
 import { computed, ref, watch } from 'vue'
-import { formatDuration, rowChannel, statusLabel, statusTone } from './gateway'
+import { formatDuration, formatTokens, rowChannel, statusLabel, statusTone, tokensPerSecond } from './gateway'
 
 const props = defineProps<{
   snapshot: Snapshot
@@ -91,11 +91,13 @@ function time(ms: number) {
 }
 function duration(row: RequestRow) {
   return formatDuration(
-    row.finished_at_ms === null ? null : row.finished_at_ms - row.started_at_ms,
+    row.usage?.timings?.latency_ms
+    ?? (row.finished_at_ms === null ? null : row.finished_at_ms - row.started_at_ms),
   )
 }
-function token(value: number | undefined) {
-  return value === undefined ? '—' : value.toLocaleString('zh-CN')
+function speed(row: RequestRow) {
+  const value = tokensPerSecond(row.usage)
+  return value === null ? '—' : value.toFixed(1)
 }
 function reset() {
   search.value = ''
@@ -182,11 +184,20 @@ function reset() {
             <th>Client Key</th>
             <th>通道</th>
             <th>状态</th>
-            <th class="gw-number">
-              耗时
+            <th
+              class="gw-number"
+              title="首字为宿主记录的首个输出 Token 延迟；完成为请求总耗时。缺失计时显示 —。"
+            >
+              首字 / 完成
             </th>
             <th class="gw-number">
               Tokens 入 / 出
+            </th>
+            <th
+              class="gw-number"
+              title="输出 Tokens ÷（完成耗时 − 首字耗时），使用宿主同一条计时；数据不足时显示 —。"
+            >
+              tok/s
             </th>
             <th><span class="gw-sr-only">操作</span></th>
           </tr>
@@ -223,12 +234,17 @@ function reset() {
                 </span>
               </td>
               <td class="gw-number gw-mono">
+                {{ formatDuration(row.usage?.timings?.first_token_ms ?? null) }}
+                <span class="gw-subtle">/</span>
                 {{ duration(row) }}
               </td>
               <td class="gw-number gw-mono">
-                {{ token(row.usage?.input_tokens) }}
+                {{ formatTokens(row.usage?.input_tokens) }}
                 <span class="gw-subtle">/</span>
-                {{ token(row.usage?.output_tokens) }}
+                {{ formatTokens(row.usage?.output_tokens) }}
+              </td>
+              <td class="gw-number gw-mono">
+                {{ speed(row) }}
               </td>
               <td>
                 <button
@@ -246,7 +262,7 @@ function reset() {
               </td>
             </tr>
             <tr v-if="expanded === row.request_id" class="gw-detail-row">
-              <td colspan="8">
+              <td colspan="9">
                 <dl class="gw-request-detail">
                   <div>
                     <dt>请求 ID</dt>
@@ -280,7 +296,7 @@ function reset() {
             </tr>
           </template>
           <tr v-if="!visible.length">
-            <td colspan="8" class="gw-empty">
+            <td colspan="9" class="gw-empty">
               <p>
                 {{ snapshot.records.length ? "没有匹配的请求" : "暂无请求记录" }}
               </p>

@@ -29,6 +29,15 @@ pub struct Failure {
     pub client_status_code: Option<u16>,
 }
 
+/// 宿主实测耗时；缺失即未知，不用桥接时间补造首字耗时。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Timings {
+    #[serde(default)]
+    pub first_token_ms: Option<u64>,
+    #[serde(default)]
+    pub latency_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
     #[serde(default)]
@@ -43,6 +52,8 @@ pub struct Usage {
     pub reasoning_tokens: Option<u64>,
     #[serde(default)]
     pub total_tokens: Option<u64>,
+    #[serde(default)]
+    pub timings: Option<Timings>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,11 +95,15 @@ mod tests {
             "provider": "openai",
             "completed_at_ms": 1730000000000u64,
             "terminal": {"outcome": "succeeded", "send_state": "upstream_responded", "attempt_count": 1},
-            "usage": {"input_tokens": 22357, "output_tokens": 7, "total_tokens": 22364}
+            "usage": {"input_tokens": 22357, "output_tokens": 7, "total_tokens": 22364, "timings":{"first_token_ms":1200,"latency_ms":2600}}
         });
         let event: ObserveEvent = serde_json::from_value(value).unwrap();
         assert_eq!(event.client_key_id.as_deref(), Some("key_1"));
         assert_eq!(event.usage.as_ref().unwrap().input_tokens, Some(22357));
         assert_eq!(event.terminal.as_ref().unwrap().outcome, Outcome::Succeeded);
+        let projected = serde_json::to_value(&event).unwrap();
+        assert_eq!(projected["usage"]["timings"], serde_json::json!({"first_token_ms":1200,"latency_ms":2600}));
+        let empty: Usage = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(empty.timings.is_none());
     }
 }
