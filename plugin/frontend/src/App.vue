@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Activity, ArrowUpRight, RefreshCw, Settings2 } from '@lucide/vue'
+import { Activity, RefreshCw } from '@lucide/vue'
 import { computed, ref } from 'vue'
 import MonitorView from './MonitorView.vue'
 import SettingsView from './SettingsView.vue'
@@ -73,20 +73,12 @@ async function reload() {
 <template>
   <main class="gw-console">
     <header class="gw-header">
-      <div class="gw-brand">
-        <span class="gw-brand-mark" aria-hidden="true">
-          <ArrowUpRight :size="23" />
-        </span>
-        <div>
-          <h1>Excel 网关</h1>
-          <p>请求去向清晰，配置改动可控。</p>
-        </div>
-      </div>
+      <h1>Excel 网关</h1>
       <div class="gw-header-actions">
         <div class="gw-sync" role="status">
           <span
             class="gw-dot"
-            :class="{ 'is-warning': refreshError || !autoRefresh }"
+            :class="{ 'is-warning': refreshError, 'is-muted': !autoRefresh }"
           />{{ syncLabel }}<small>{{ updatedLabel }}</small>
         </div>
         <button
@@ -106,17 +98,18 @@ async function reload() {
         :class="{ 'is-current': tab === 'monitor' }"
         @click="tab = 'monitor'"
       >
-        <Activity :size="17" />请求监控
+        请求监控
       </button><button
         type="button"
         :aria-pressed="tab === 'settings'"
         :class="{ 'is-current': tab === 'settings' }"
         @click="tab = 'settings'"
       >
-        <Settings2 :size="17" />网关设置<span
+        网关设置<span
           v-if="dirty"
           class="gw-unsaved-dot"
-          aria-hidden="true" title="有未保存改动"
+          aria-hidden="true"
+          title="有未保存改动"
         />
       </button><span v-if="snapshot" class="gw-tabs-meta">
         <span
@@ -193,8 +186,5 @@ async function reload() {
         @reload-catalogs="loadCatalogs"
       />
     </template>
-    <footer class="gw-footer">
-      <span>Excel Companion · CPR 插件</span><span>配置修改不改变 CPR 的认证与模型授权</span>
-    </footer>
   </main>
 </template>
