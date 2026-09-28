@@ -205,3 +205,12 @@ Rust 1.97.1，Node >=24 / pnpm 12.6.0。打包：官方 `cpr-plugin package --ma
 ## 许可
 
 主体采用 Unlicense。第三方来源、固定版本及官方 SDK 的 Apache-2.0 许可见 [NOTICE.md](NOTICE.md) 和 `vendor/gateway-plugin-sdk/LICENSE`。
+
+
+### 完整上游错误记录
+
+Bridge 在协议转换/错误白名单映射之前，记录 error、response.failed、response.incomplete 和非 2xx HTTP 错误。文件位置为账户映射文件同级目录下的 error-logs/upstream-errors.jsonl，可按 request_id 精确关联。保留未知错误码、类型、完整多行消息、参数及嵌套错误字段；不再只记录字段形状，也不按 512 字符截断服务器记录。非 2xx 响应同时保存解析后的错误及完整文本。
+
+仅服务器保存该诊断日志：目录 0700、文件 0600；单文件达到 32 MiB 时按完整记录轮转，保留当前文件与 5 个历史文件（单条超大错误不会被截断）。凭据字段、Bearer/Basic、常见 API key/JWT/私钥以及本次请求的真实认证值替换为 [REDACTED]。非错误的完整请求、请求头、工具目录和模型输出不额外归档；省略字段列于 omitted_non_error_fields。普通错误内容保持原样，脱敏后的记录不等同于未经处理的原始字节。
+
+客户端错误分类、拒绝语义和重试策略保持不变，不向客户端或普通 Docker 日志公开完整错误。写入失败会输出不含错误载荷的 bridge error_record_failed，启动时检查日志文件可写。历史上已经丢弃的错误子码无法补回；此功能覆盖部署后的新请求。

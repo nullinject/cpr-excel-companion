@@ -3,6 +3,7 @@ pub mod admission;
 pub mod attachments;
 pub mod auth;
 pub mod control;
+pub mod error_log;
 pub mod history;
 pub mod observe;
 pub mod stream;

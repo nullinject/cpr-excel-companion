@@ -190,6 +190,24 @@ fn cached_client(app: &App, id: &str, route: &Account) -> Result<reqwest::Client
     clients.insert(id.to_owned(), (route.clone(), client.clone()));
     Ok(client)
 }
+// Full upstream errors stay in a private, rotating server log, not client responses.
+fn upstream_error_log(app: &App) -> excel::error_log::ErrorLog {
+    let parent = std::path::Path::new(&app.config_path).parent().unwrap_or_else(|| std::path::Path::new("."));
+    excel::error_log::ErrorLog::new(parent.join("error-logs/upstream-errors.jsonl"))
+}
+fn error_log_secrets(app: &App, headers: &HeaderMap, context_token: &str) -> Vec<String> {
+    let mut values = vec![context_token.to_owned(), String::from_utf8_lossy(&app.secret).into_owned()];
+    for name in ["authorization", "proxy-authorization", "cookie", "x-api-key", "x-excel-bridge-context"] {
+        if let Some(value) = headers.get(name).and_then(|v| v.to_str().ok()) {
+            values.push(value.to_owned());
+            if let Some((scheme, token)) = value.split_once(' ') {
+                if scheme.eq_ignore_ascii_case("bearer") || scheme.eq_ignore_ascii_case("basic") { values.push(token.to_owned()); }
+            }
+        }
+    }
+    values
+}
+
 // Opt-in, short-lived forensic capture. Never capture headers, credentials or full requests.
 // An operator supplies a key hash + expiry; at most 8 failed tool events are saved privately.
 fn capture_tool_failure(app: &App, ctx: &Context, event: &Value) {
@@ -403,8 +421,19 @@ async fn open_events(
     app: Arc<App>,
     identity: Identity,
     headers: HeaderMap,
+    source: Value,
+    native: Option<native::Session>,
+) -> Result<Events, Failure> {
+    open_events_at(app, identity, headers, source, native, excel::ENDPOINT).await
+}
+// The endpoint is internal, never request/config controlled; tests use a loopback fixture.
+async fn open_events_at(
+    app: Arc<App>,
+    identity: Identity,
+    headers: HeaderMap,
     mut source: Value,
     native: Option<native::Session>,
+    excel_endpoint: &'static str,
 ) -> Result<Events, Failure> {
     let started = Instant::now();
     // 未签名连接：绑定未命中的 key，仅原生透传；-excel 后缀在此还原避免上游拒绝。
@@ -553,10 +582,11 @@ async fn open_events(
         body = source;
     }
     let endpoint = if ctx.excel {
-        excel::ENDPOINT
+        excel_endpoint
     } else {
         "https://chatgpt.com/backend-api/codex/responses"
     };
+    let error_secrets = error_log_secrets(&app, &headers, &token);
     let upstream_started = Instant::now();
     let response = match client
         .post(endpoint)
@@ -575,6 +605,14 @@ async fn open_events(
         let status = response.status();
         // 上游拒绝原因对排障关键；截断后随错误体返回给宿主重试链路。
         let detail = response.text().await.unwrap_or_default();
+        let secrets: Vec<&str> = error_secrets.iter().map(String::as_str).collect();
+        if let Err(error) = upstream_error_log(&app).record_http(&ctx.request_id, status.as_u16(), &detail, &secrets) {
+            eprintln!("bridge error_record_failed {} kind={:?}", ctx.request_id, error.kind());
+        }
+        // Preserve the bounded client response while excluding credentials.
+        let parsed = serde_json::from_str::<Value>(&detail).unwrap_or_else(|_| json!(detail));
+        let clean = excel::error_log::sanitize(&parsed, &secrets);
+        let detail = clean.as_str().map(str::to_owned).unwrap_or_else(|| clean.to_string());
         eprintln!("bridge request {} upstream status {status}", ctx.request_id);
         let mut message = format!("upstream status {status}");
         let detail = detail.trim();
@@ -597,6 +635,7 @@ async fn open_events(
         upstream_started.elapsed().as_millis(),
         response.status().as_u16()
     );
+    let upstream_http_status = response.status().as_u16();
     let mut wire = response.bytes_stream();
     Ok(Box::pin(async_stream::stream! {
         let lease = lease;
@@ -621,6 +660,10 @@ async fn open_events(
                 last_event = event["type"].as_str().unwrap_or("unknown").to_owned();
                 if first_event { eprintln!("bridge timing {} first_event_ms={}", ctx.request_id, started.elapsed().as_millis()); first_event = false; }
                 if matches!(last_event.as_str(), "error" | "response.failed" | "response.incomplete") {
+                    let secrets: Vec<&str> = error_secrets.iter().map(String::as_str).collect();
+                    if let Err(error) = upstream_error_log(&app).record_event(&ctx.request_id, upstream_http_status, &event, &secrets) {
+                        eprintln!("bridge error_record_failed {} kind={:?}", ctx.request_id, error.kind());
+                    }
                     let (code, _, _) = excel::stream::failure_details(&event);
                     eprintln!("bridge upstream_terminal {} event={} code={} reason={} elapsed_ms={} error_fields={}",
                         ctx.request_id, last_event, code, excel::stream::incomplete_reason(&event), started.elapsed().as_millis(), excel::stream::failure_diagnostics(&event));
@@ -984,6 +1027,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(|v| v != "0" && v.to_lowercase() != "false")
             .unwrap_or(true),
     });
+    upstream_error_log(&app).check()?;
     let router = Router::new()
         .route("/healthz", get(|| async { StatusCode::NO_CONTENT }))
         .route("/_control/{operation}", post(control))
@@ -1177,5 +1221,47 @@ mod account_route_tests {
         let result = unsigned_client(&app, None);
         std::fs::remove_file(path).unwrap();
         assert!(result.is_err(), "missing identity must never select the first account");
+    }
+}
+
+
+#[cfg(test)]
+mod complete_error_record_tests {
+    use super::*;
+    #[tokio::test]
+    async fn records_before_stream_translation_and_http_truncation() {
+        for status in [StatusCode::OK, StatusCode::BAD_REQUEST] {
+            let root=std::env::temp_dir().join(format!("excel-error-record-{}",uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            let map=root.join("accounts.json");
+            std::fs::write(&map, r#"{"accounts":{"test":{"direct":true,"proxy":null}}}"#).unwrap();
+            let app=Arc::new(App { secret:vec![b'x';32],config_path:map.to_string_lossy().into_owned(),control:Arc::new(excel::control::Control::load(root.join("policy.json")).unwrap()),suffix:"-excel".into(),allow_unsigned:false,clients:Mutex::new(BTreeMap::new()) });
+            app.control.save(excel::admission::Policy {enabled:true,..Default::default()},Some(0)).unwrap();
+            let message=format!("field input rejected: {} END_OF_FULL_ERROR", "detail ".repeat(2000));
+            let event=json!({"type":"error","error":{"code":"new_provider_validation_error","type":"invalid_request_error","message":message,"param":"input[1]","details":{"constraint":"must be tool output"}}});
+            let payload=if status.is_success() { format!("event: error\ndata: {event}\n\n") } else { event.to_string() };
+            let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address=listener.local_addr().unwrap();
+            let mock=Router::new().route("/",post(move || { let payload=payload.clone(); async move {(status,[("content-type","text/event-stream")],payload)} }));
+            let server=tokio::spawn(async move { axum::serve(listener,mock).await.unwrap(); });
+            let ctx=Context {account:"test".into(),scope:"error-record-test".into(),request_id:format!("req_record_{}",status.as_u16()),excel:true,key:None,expires:SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()+60};
+            let token=excel::auth::sign(&ctx,&app.secret).unwrap();
+            let source=json!({"model":"gpt-6-astra-excel","input":[{"role":"user","content":"diagnostic fixture"}],"client_metadata":{"_cpr_excel_bridge":token}});
+            let mut headers=HeaderMap::new();headers.insert("authorization","Bearer fixture_account_credential".parse().unwrap());
+            let endpoint: &'static str=Box::leak(format!("http://{address}/").into_boxed_str());
+            let result=open_events_at(app,Identity::Signed(Box::new(ctx.clone())),headers,source,None,endpoint).await;
+            if status.is_success() {
+                let output=result.unwrap().collect::<Vec<_>>().await;
+                assert!(output.iter().any(|e| e.as_ref().is_ok_and(|v|v["type"]=="response.failed")));
+                assert!(!format!("{output:?}").contains("END_OF_FULL_ERROR"));
+            } else { assert_eq!(result.err().unwrap().0,status); }
+            let text=std::fs::read_to_string(root.join("error-logs/upstream-errors.jsonl")).unwrap();
+            let record:Value=serde_json::from_str(text.trim()).unwrap();
+            let saved=if status.is_success() {&record["upstream_event"]} else {&record["upstream_body"]};
+            assert_eq!(saved["error"],event["error"]);
+            assert_eq!(record["request_id"],ctx.request_id);
+            assert_eq!(record["http_status"],status.as_u16());
+            server.abort(); std::fs::remove_dir_all(root).unwrap();
+        }
     }
 }
