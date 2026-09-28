@@ -59,3 +59,6 @@
 ## 验证
 
 生产实测通过：原生透传、Excel 非流式（sol/terra）、Excel 流式（astra，WebSocket 上游）、model_requests 用量与计费、侧边栏观察归并。`cargo test --workspace --locked` 与 `cargo clippy -D warnings` 全绿；前端 pnpm build / lint 通过。
+## 0.8.8 · 2026-09-28
+
+- Added opt-in safe prompt translation for the latest user message and bounded retry for recognized pre-output policy rejections.
