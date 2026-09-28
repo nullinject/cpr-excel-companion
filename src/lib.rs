@@ -6,7 +6,6 @@ pub mod control;
 pub mod error_log;
 pub mod history;
 pub mod observe;
-pub mod prompt_normalization;
 pub mod stream;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};

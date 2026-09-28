@@ -31,14 +31,6 @@ const sections = [
   { id: 'accounts', label: '账户范围' },
   { id: 'connection', label: '连接信息' },
 ]
-const normalizePrompt = computed({
-  get: () => policy.value.normalize_user_prompt ?? false,
-  set: (value: boolean) => { policy.value.normalize_user_prompt = value },
-})
-const policyRetry = computed({
-  get: () => policy.value.retry_policy_errors ?? false,
-  set: (value: boolean) => { policy.value.retry_policy_errors = value },
-})
 const seconds = computed({
   get: () => policy.value.queue_timeout_ms / 1000,
   set: (value: number) => {
@@ -136,26 +128,6 @@ const selectedCount = computed(
               限制 Excel 请求的并发和等待时间，不调整上游额度。
             </p>
             <div class="gw-form-rows">
-              <label class="gw-field" for="gw-normalize-prompt">
-                <span>提示词规范化</span>
-                <div>
-                  <select id="gw-normalize-prompt" v-model="normalizePrompt">
-                    <option :value="false">关闭（默认）</option>
-                    <option :value="true">启用：保留原意、明确任务结构</option>
-                  </select>
-                  <small>仅为最新用户文本补充结构说明，原文、附件与历史不删除；不虚构授权、不覆盖过滤参数，不因拦截自动启用。不是规避审核改写。</small>
-                </div>
-              </label>
-              <label class="gw-field" for="gw-policy-retry">
-                <span>策略拦截处理</span>
-                <div>
-                  <select id="gw-policy-retry" v-model="policyRetry">
-                    <option :value="false">忠实返回（默认）</option>
-                    <option :value="true">无输出时最多重试 5 次</option>
-                  </select>
-                  <small>仅 Excel 通道；原账户、原请求，最多额外 5 次（共 6 次请求），逐次退避。已出现文本、推理、工具或用量时不重试；用尽后忠实返回，可能增加耗时和上游用量。</small>
-                </div>
-              </label>
               <label class="gw-field" for="gw-concurrency">
                 <span>最大并发</span>
                 <div>

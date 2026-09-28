@@ -15,8 +15,6 @@ export interface Policy {
   overflow: 'queue' | 'reject'
   queue_capacity: number
   queue_timeout_ms: number
-  retry_policy_errors?: boolean
-  normalize_user_prompt?: boolean
 }
 
 export function setChannel(

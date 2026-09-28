@@ -139,58 +139,6 @@ pub fn is_terminal(event: &Value) -> bool {
     matches!(event["type"].as_str(), Some("response.completed" | "response.failed" | "response.incomplete" | "error"))
 }
 
-/// Buffer only lifecycle metadata until the first externally meaningful event.
-/// A policy recheck never rewrites input, changes account, or replays delivered output.
-pub enum RetryDecision {
-    Hold,
-    /// Original prelude and rejection, retained if the recheck cannot be opened.
-    Retry(Vec<Value>),
-    Forward(Vec<Value>),
-}
-pub const MAX_POLICY_RETRIES: u8 = 5;
-pub struct RejectionRetry {
-    eligible: bool,
-    retries: u8,
-    prelude: Vec<Value>,
-    bytes: usize,
-}
-impl RejectionRetry {
-    pub fn new(enabled: bool) -> Self {
-        Self { eligible: enabled, retries: 0, prelude: Vec::new(), bytes: 0 }
-    }
-    pub fn retries(&self) -> u8 { self.retries }
-    pub fn event(&mut self, event: Value) -> RetryDecision {
-        let kind = event["type"].as_str().unwrap_or("");
-        if self.eligible && matches!(kind, "response.created" | "response.in_progress") {
-            self.bytes = self.bytes.saturating_add(event.to_string().len());
-            if self.prelude.len() < 16 && self.bytes <= 32 * 1024 {
-                self.prelude.push(event);
-                return RetryDecision::Hold;
-            }
-        }
-        let policy = matches!(failure_details(&event).0,
-            "cyber_policy" | "bio_policy" | "misalignment_policy_violation" | "content_filter");
-        // A reported usage/output payload must not be discarded or charged invisibly.
-        let no_usage = event.pointer("/response/usage").is_none_or(Value::is_null)
-            && event.get("usage").is_none_or(Value::is_null);
-        let no_output = [event.pointer("/response/output"), event.get("output")].into_iter()
-            .all(|v| v.is_none_or(|v| v.is_null() || v.as_array().is_some_and(Vec::is_empty)));
-        let retry = self.eligible && matches!(kind, "error" | "response.failed")
-            && policy && no_usage && no_output;
-        self.prelude.push(event);
-        let events = std::mem::take(&mut self.prelude);
-        self.bytes = 0;
-        if retry {
-            self.retries += 1;
-            self.eligible = self.retries < MAX_POLICY_RETRIES;
-            RetryDecision::Retry(events)
-        } else {
-            self.eligible = false;
-            RetryDecision::Forward(events)
-        }
-    }
-}
-
 pub struct Translator {
     tools: Tools,
     emitted: BTreeSet<String>,
