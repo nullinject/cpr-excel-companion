@@ -43,7 +43,7 @@ pub enum Channel {
 /// Excel = 无后缀请求也强制走 Excel（仅签名请求）；Native = 带 -excel 后缀也压回原生。
 pub type ModelChannels = BTreeMap<String, Channel>;
 
-/// 单个 Key 的模型通道覆盖；优先级高于全局 model_channels。
+/// 保留旧策略中的 Key 覆盖数据；当前执行路径不应用此字段。
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeyRule {
@@ -60,7 +60,7 @@ pub struct Policy {
     pub client_keys: Scope,
     #[serde(default)]
     pub model_channels: ModelChannels,
-    /// 按 Key 的模型通道覆盖，键为 CPR 的 client key ID。
+    /// 历史字段，键为 CPR 的 client key ID；保留数据，不作为路由或授权依据。
     #[serde(default)]
     pub key_rules: BTreeMap<String, KeyRule>,
     pub concurrency: usize,

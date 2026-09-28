@@ -11,8 +11,7 @@ pub struct Context {
     pub scope: String,
     pub request_id: String,
     pub excel: bool,
-    /// 客户端 API key 的 sha256 摘要（request 阶段提取，随签名保护传输）；
-    /// 桥接据此应用按 Key 的模型通道规则。
+    /// 兼容早期签名消息的可选摘要；当前插件不填写，不作为请求身份或路由依据。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
     pub expires: u64,

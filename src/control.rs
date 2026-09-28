@@ -72,7 +72,7 @@ struct Inner {
     gate: Arc<Gate>,
     active: BTreeSet<String>,
     records: VecDeque<Record>,
-    /// 学到的 key 摘要 → CPR key ID（来自观察归并），用于解析按 Key 规则。
+    /// 旧版摘要与终态观察的归并索引，仅用于记录，不参与当前请求路由。
     key_map: BTreeMap<String, String>,
 }
 pub struct Control {

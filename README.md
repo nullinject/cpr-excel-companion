@@ -87,17 +87,20 @@ Codex Desktop CLI 0.158.0-alpha.2.1 使用真实 Key，各模型 3 轮：创建�
 2. Provider 把账户出口代理无条件套用到 base_url 连接（`Proxy::all`，无回环豁免）。桥接必须经账户代理可达：部署时通过反代公网路由（如 Caddy `/excel-companion/*`）回源，桥接再按映射代理回 BPS。
 3. 宿主按请求元数据覆写正文 `model` 字段，插件层改写无效。`-excel` 后缀由桥接的 `prepare()` 还原为上游模型名。
 
-## 按 Key × 模型切换 Excel / 原生
+## Client Key 绑定与模型通道
 
-三个层级，全部可用：
+无需修改 CPR。**Key 范围由 CPR 原生插件绑定决定，范围内共用模型通道规则**；这两个功能不能等同为任意的 Key × 模型独立矩阵。
 
-1. **按 Key（哪些 Key 能用 Excel）**：CPR 插件实例的「绑定」`clientKeyIds`——宿主持有 key 身份并按绑定过滤，绑定的 key 触发签名，未绑定的 key 由桥接原生透传（自动还原 `-excel` 后缀名）。在 CPR 插件实例编辑器中修改，保存即生效。
-2. **按模型（全局默认通道）**：侧栏「模型通道」按基础模型名三态切换（跟随后缀 / Excel / 原生）。"Excel" = 无后缀也强制走 Excel；"原生" = 带 `-excel` 后缀也压回原生。预制四款模型（gpt-5.6-sol/terra/luna、gpt-6-astra），请求中出现的新模型自动补充。
-3. **按请求（客户端选择）**：`-excel` 后缀 = Excel，原模型名 = 原生，同一个 key 下自由混用。
+- CPR 插件管理 → 当前配置 → 绑定：通过 clientKeyIds、账号组和模型范围筛选哪些请求进入插件。未匹配的请求走原生透传。
+- 网关设置 → 通道与路由：按基础模型名选择“跟随客户端 / Excel / 原生”，查看原模型名与 -excel 后缀名各自的模型级规则；支持批量设置。
+- 网关设置 → 并发与排队、账户范围：管理桥接执行容量和 Excel 账户范围。
+- 安装、升级、授权和宿主绑定仍在 CPR 插件管理处理。插件页面没有修改自身绑定的宿主 API，不读取管理员凭据绕过页面隔离。
 
-按 Key × 模型的精细矩阵 = 1 + 2/3 组合：绑定决定 key 是否进入 Excel 通道，模型通道/后缀决定具体走向。
+### 早期版本的 Key 选择器
 
-> **为什么侧栏不能直接按 Key 切换**：官方 3.16.0 宿主对插件隐藏客户端身份——request 阶段头投影实测只含 `user-agent` 和 `content-type`（无 authorization），attempt 阶段头为空。key 身份只在宿主准入层（原生 key 模型规则/预算）与绑定匹配器中存在。桥接已内置按 Key 规则引擎（`key_rules`，key 摘要经签名上下文传递 + 观察归并学习映射），未来宿主一旦投影身份即可用，无需再改协议。
+v0.1.1 确实有 Key 列表和 client_keys 配置，但当时 Control::enter 传给 permits_request 的是手工配置的 ctx.scope（isolationScope），并非宿主认证的请求 Key ID。同版本 README 已注明多 Key 隔离未完成。后续 key_rules 只是持久化字段，当前执行路径没有读取它；“规则引擎已内置、以后自动生效”的旧说明不准确。
+
+现保留历史策略数据，不增加伪造的 Key 身份，不从完成后的用量观察猜测当前请求。已移除未注册的 request 阶段 Authorization 摘要提取；attempt 签名、账户校验和 CPR 授权保持不变。**本次设置页整理不宣称完成逐 Key 独立模型路由。**
 
 ## 模型通道（按基础模型名的三态开关）
 
@@ -117,7 +120,7 @@ Codex Desktop CLI 0.158.0-alpha.2.1 使用真实 Key，各模型 3 轮：创建�
 
 ## 已知边界
 
-1. **多 Key 隔离靠策略字段。** 桥接准入按模型/账户/Key 白黑名单与并发队列控制；同实例多租户混用未经隔离验收，Key 白名单不构成安全边界。
+1. **Key 准入由 CPR 授权与原生绑定负责。** 桥接只对已签名请求应用全局模型/账户范围及并发队列。历史 client_keys、key_rules 字段不参与当前路由，也不构成隔离边界；静态 isolationScope 不代表请求 Key。
 2. 队列拒绝返回 429，会触发 CPR 重试；提前失败的记录可能归类为取消。
 3. 目录、配额等非生成路由未适配。
 4. 反代/CDN 注入头（`cf-*`、`x-forwarded-*`、`cdn-loop`）由桥接剥离；若上游风控策略变化，透传请求可能需要更新剥离清单。
@@ -159,8 +162,6 @@ Codex Desktop CLI 0.158.0-alpha.2.1 使用真实 Key，各模型 3 轮：创建�
 | --- | --- |
 | `secretFile` | 插件进程可读的共享密钥路径，默认 `/run/secrets/excel-bridge.key` |
 | `isolationScope` | 实例作用域，必填 |
-| `excelEnabled` | 总开关，默认 true |
-| `excelModelSuffix` | Excel 模型后缀，默认 `-excel` |
 | `bridgeControlUrl` | 桥接控制地址，共享 netns 部署用 `http://127.0.0.1:8089/_control` |
 | `showPage` | 管理页开关，默认 true |
 
