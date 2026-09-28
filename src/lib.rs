@@ -248,7 +248,10 @@ pub fn prepare(source: &Value, original_calls: &BTreeMap<String, Value>) -> Resu
         }
     }
     if tools.get("functions.exec").is_some_and(|tool| tool.custom) {
-        input.push(json!({"type":"message","role":"developer","content":[{"type":"input_text","text":
+        // A compaction trigger is request control and must remain the final item.
+        let reminder_index = input.len()
+            - usize::from(input.last().is_some_and(|item| item["type"] == "compaction_trigger"));
+        input.insert(reminder_index, json!({"type":"message","role":"developer","content":[{"type":"input_text","text":
             "Tool routing reminder: APIs documented inside functions.exec (tools.* or mcp__* names) are NOT top-level client tools. Invoke them through outer run_officejs references=[\"functions.exec\"] with JavaScript code such as text(await tools.API_NAME({...}));. Outer references must use a top-level Catalog name. Do not repeat a tool call whose result is already in history."}]}));
     }
     let mut result = json!({"model":model,"model_selection":"explicit","store":false,"stream":true,"input":input,"reasoning_effort":effort});

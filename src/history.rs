@@ -93,7 +93,13 @@ pub fn save(scope: &str, input: &[Value], response: &Value) {
     let (Some(id), Some(output)) = (response["id"].as_str(), response["output"].as_array()) else {
         return;
     };
-    let mut history = input.to_vec();
+    // One-shot request controls are not conversation history. Keep actual
+    // compaction output (including its encrypted content) for continuation.
+    let mut history: Vec<Value> = input
+        .iter()
+        .filter(|item| item["type"] != "compaction_trigger")
+        .cloned()
+        .collect();
     history.extend(output.iter().cloned());
     if serde_json::to_vec(&history).map_or(true, |bytes| bytes.len() > 2 * 1024 * 1024) {
         return;
