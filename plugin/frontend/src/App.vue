@@ -1,20 +1,11 @@
 <script setup lang="ts">
+import type { Policy } from './gateway'
 import { BaseButton, BaseCard } from '@codex-proxy/ui'
-import { computed, onMounted, onUnmounted, ref } from 'vue'
 
-interface Scope { allow: string[], deny: string[] }
-interface Policy {
-  enabled: boolean
-  models: Scope
-  accounts: Scope
-  client_keys: Scope
-  model_channels: Record<string, 'excel' | 'native'>
-  key_rules: Record<string, { models: Record<string, 'excel' | 'native'> }>
-  concurrency: number
-  overflow: 'queue' | 'reject'
-  queue_capacity: number
-  queue_timeout_ms: number
-}
+import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { setChannel } from './gateway'
+import RoutingSettings from './RoutingSettings.vue'
+
 interface Row {
   request_id: string
   model: string
@@ -37,12 +28,14 @@ const snapshot = ref<Snapshot | null>(null)
 const policy = ref<Policy | null>(null)
 const version = ref<number | null>(null)
 const error = ref('')
+const refreshError = ref('')
 const success = ref('')
 const saving = ref(false)
 const tab = ref<'monitor' | 'settings'>('monitor')
 const filter = ref('')
 const options = ref<{ accounts: { account_id: string, enabled: boolean }[], keys: { id: string, name: string, enabled: boolean }[] }>({ accounts: [], keys: [] })
-const pluginInfo = ref<{ excelMode?: string, excelModelSuffix?: string, excelEnabled?: boolean, isolationScope: string } | null>(null)
+const pluginInfo = ref<{ excelModelSuffix?: string, isolationScope: string, routingMode?: 'host_binding' } | null>(null)
+const optionsError = ref('')
 // Excel 通道预制模型（原项目固定四款），无需手动添加
 const PRESET_MODELS = ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-6-astra'] as const
 const channelFilter = ref<'all' | 'excel' | 'native' | 'unsigned'>('all')
@@ -56,24 +49,12 @@ const keyNames = computed(() => {
 function keyLabel(id: string | null): string {
   if (!id || id === 'unsigned')
     return '未签名'
-  return keyNames.value.get(id) ?? id.slice(0, 14) + '…'
+  return keyNames.value.get(id) ?? `${id.slice(0, 14)}…`
 }
 function baseName(model: string): string {
   const suffix = pluginInfo.value?.excelModelSuffix ?? '-excel'
   return model.endsWith(suffix) && model.length > suffix.length ? model.slice(0, -suffix.length) : model
 }
-function modelState(model: string): 'suffix' | 'excel' | 'native' {
-  return policy.value?.model_channels[model] ?? 'suffix'
-}
-function setModelState(model: string, state: 'suffix' | 'excel' | 'native') {
-  const p = policy.value
-  if (!p) return
-  if (state === 'suffix')
-    delete p.model_channels[model]
-  else
-    p.model_channels[model] = state
-}
-
 const knownModels = computed(() => {
   const set = new Set<string>(PRESET_MODELS)
   for (const row of snapshot.value?.records ?? []) {
@@ -86,25 +67,36 @@ const knownModels = computed(() => {
 const accountList = computed(() => {
   const map = new Map<string, boolean>()
   for (const a of options.value.accounts) map.set(a.account_id, a.enabled)
-  for (const id of policy.value?.accounts.allow ?? []) if (!map.has(id)) map.set(id, true)
-  for (const id of policy.value?.accounts.deny ?? []) if (!map.has(id)) map.set(id, true)
+  for (const id of policy.value?.accounts.allow ?? []) {
+    if (!map.has(id))
+      map.set(id, true)
+  }
+  for (const id of policy.value?.accounts.deny ?? []) {
+    if (!map.has(id))
+      map.set(id, true)
+  }
   return [...map.entries()].map(([id, enabled]) => ({ id, enabled }))
 })
 function accountAllowed(id: string): boolean {
   const p = policy.value
-  if (!p) return true
-  if (p.accounts.deny.includes(id)) return false
-  if (p.accounts.allow.length > 0 && !p.accounts.allow.includes(id)) return false
+  if (!p)
+    return true
+  if (p.accounts.deny.includes(id))
+    return false
+  if (p.accounts.allow.length > 0 && !p.accounts.allow.includes(id))
+    return false
   return true
 }
 function setAccountAllowed(id: string, allowed: boolean) {
   const p = policy.value
-  if (!p) return
+  if (!p)
+    return
   p.accounts.deny = p.accounts.deny.filter(a => a !== id)
   if (allowed) {
     if (p.accounts.allow.length > 0)
       p.accounts.allow = [...new Set([...p.accounts.allow, id])]
-  } else {
+  }
+  else {
     p.accounts.allow = p.accounts.allow.filter(a => a !== id)
     p.accounts.deny.push(id)
   }
@@ -128,19 +120,24 @@ async function refresh(loadForm = false) {
       policy.value = structuredClone(data.policy)
       version.value = data.version
     }
-    error.value = ''
+    refreshError.value = ''
+    return true
   }
-  catch (cause) { error.value = cause instanceof Error ? cause.message : '读取失败' }
+  catch (cause) {
+    refreshError.value = cause instanceof Error ? cause.message : '读取失败'
+    return false
+  }
 }
 async function loadOptions() {
   try {
     options.value = await api('api/options')
+    optionsError.value = ''
   }
-  catch { /* 选项加载失败不阻塞页面，Key 显示退回 ID */ }
+  catch { optionsError.value = '无法读取 Client Key 列表，请刷新重试。' }
   try {
     pluginInfo.value = await api('api/plugin-info')
   }
-  catch { /* 同上 */ }
+  catch { optionsError.value = '读取插件连接信息失败，请刷新重试。' }
 }
 const stats = computed(() => {
   const rows = snapshot.value?.records ?? []
@@ -152,55 +149,54 @@ const stats = computed(() => {
     if (row.excel) {
       if (row.status === 'succeeded' || row.status === 'completed')
         excel += 1
-      else
+      else if (['failed', 'cancelled', 'rejected', 'rejected_capacity', 'incomplete'].includes(row.status))
         excelFailed += 1
-    } else if (row.source === 'unsigned') {
+    }
+    else if (row.source === 'unsigned') {
       passthrough += 1
-    } else if (row.status === 'succeeded' || row.status === 'completed') {
+    }
+    else if (row.status === 'succeeded' || row.status === 'completed') {
       native += 1
     }
   }
   return { excel, excelFailed, passthrough, native, total: rows.length }
 })
-const learnedKeys = computed(() => {
-  const counts = new Map<string, { excel: number, native: number }>()
-  for (const row of snapshot.value?.records ?? []) {
-    if (!row.client_key_id || row.client_key_id === 'unsigned')
-      continue
-    const entry = counts.get(row.client_key_id) ?? { excel: 0, native: 0 }
-    if (row.excel)
-      entry.excel += 1
-    else
-      entry.native += 1
-    counts.set(row.client_key_id, entry)
-  }
-  return [...counts.entries()].map(([id, c]) => ({ id, name: keyNames.value.get(id) ?? id.slice(0, 14) + '…', ...c })).sort((a, b) => b.excel + b.native - (a.excel + a.native))
-})
 function rowChannel(row: Row): 'excel' | 'native' | 'unsigned' {
-  if (row.source === 'unsigned') return 'unsigned'
+  if (row.source === 'unsigned')
+    return 'unsigned'
   return row.excel ? 'excel' : 'native'
 }
 function rows() {
   return snapshot.value?.records.filter((row) => {
     if (channelFilter.value !== 'all' && rowChannel(row) !== channelFilter.value)
       return false
-    if (!filter.value) return true
+    if (!filter.value)
+      return true
     const key = keyLabel(row.client_key_id)
     return `${row.model} ${row.request_id} ${row.status} ${key} ${row.error ?? ''} ${row.error_code ?? ''}`.includes(filter.value)
   }) ?? []
 }
 function duration(row: Row): string {
-  if (row.finished_at_ms == null) return '—'
+  if (row.finished_at_ms == null)
+    return '—'
   return `${row.finished_at_ms - row.started_at_ms} ms`
 }
 function tokens(row: Row): string {
-  if (!row.usage) return '—'
+  if (!row.usage)
+    return '—'
   return `${row.usage.input_tokens ?? '—'} / ${row.usage.output_tokens ?? '—'}`
 }
 function statusText(row: Row): string {
   const map: Record<string, string> = {
-    succeeded: '成功', completed: '成功', running: '执行中', queued: '排队中',
-    failed: '失败', cancelled: '已取消', rejected: '已拒绝', rejected_capacity: '容量已满', incomplete: '不完整',
+    succeeded: '成功',
+    completed: '成功',
+    running: '执行中',
+    queued: '排队中',
+    failed: '失败',
+    cancelled: '已取消',
+    rejected: '已拒绝',
+    rejected_capacity: '容量已满',
+    incomplete: '不完整',
   }
   return map[row.status] ?? row.status
 }
@@ -211,10 +207,12 @@ function channelText(row: Row): string {
 async function save() {
   saving.value = true
   success.value = ''
+  error.value = ''
   try {
-    await api('api/policy', { policy: policy.value, expected_version: version.value })
-    await refresh(true)
-    success.value = '配置已保存'
+    const saved = await api('api/policy', { policy: policy.value, expected_version: version.value })
+    version.value = saved.version
+    const refreshed = await refresh(true)
+    success.value = refreshed ? '配置已保存' : '配置已保存，但重新读取失败；请刷新确认。'
   }
   catch (cause) { error.value = cause instanceof Error ? cause.message : '保存失败' }
   finally { saving.value = false }
@@ -229,7 +227,8 @@ onMounted(() => {
   }, 5000)
 })
 onUnmounted(() => {
-  if (timer) clearInterval(timer)
+  if (timer)
+    clearInterval(timer)
 })
 </script>
 
@@ -249,8 +248,8 @@ onUnmounted(() => {
         刷新
       </BaseButton>
     </nav>
-    <p v-if="error" class="error" role="alert">
-      {{ error }}
+    <p v-if="error || refreshError" class="error" role="alert">
+      {{ error || refreshError }}
     </p>
     <p v-if="success" role="status">
       {{ success }}
@@ -259,24 +258,44 @@ onUnmounted(() => {
     <template v-if="tab === 'monitor'">
       <div class="cards">
         <div class="card">
-          <div class="num">{{ stats.excel }}</div>
-          <div class="label">Excel 成功</div>
+          <div class="num">
+            {{ stats.excel }}
+          </div>
+          <div class="label">
+            Excel 成功
+          </div>
         </div>
         <div class="card">
-          <div class="num bad">{{ stats.excelFailed }}</div>
-          <div class="label">Excel 失败/取消</div>
+          <div class="num bad">
+            {{ stats.excelFailed }}
+          </div>
+          <div class="label">
+            Excel 失败/取消
+          </div>
         </div>
         <div class="card">
-          <div class="num">{{ stats.passthrough }}</div>
-          <div class="label">未签名透传</div>
+          <div class="num">
+            {{ stats.passthrough }}
+          </div>
+          <div class="label">
+            未签名透传
+          </div>
         </div>
         <div class="card">
-          <div class="num">{{ stats.native }}</div>
-          <div class="label">已签名走原生</div>
+          <div class="num">
+            {{ stats.native }}
+          </div>
+          <div class="label">
+            已签名走原生
+          </div>
         </div>
         <div class="card">
-          <div class="num">{{ stats.total }}</div>
-          <div class="label">记录总数</div>
+          <div class="num">
+            {{ stats.total }}
+          </div>
+          <div class="label">
+            记录总数
+          </div>
         </div>
       </div>
       <BaseCard>
@@ -325,89 +344,105 @@ onUnmounted(() => {
       </BaseCard>
     </template>
 
-    <template v-if="tab === 'settings' && policy">
+    <form v-if="tab === 'settings' && policy" class="gateway-form" @submit.prevent="save">
       <BaseCard>
         <div class="row-line">
-          <label class="switch-line">
-            <input v-model="policy.enabled" type="checkbox"> Excel 通道开启
-          </label>
-          <small>关闭后所有请求走原生，即使模型带 -excel 后缀</small>
+          <div>
+            <h2 class="section-title">
+              通道与路由
+            </h2><small>为 CPR 绑定范围内的请求设置默认通道；不修改 Key 授权。</small>
+          </div>
+          <label for="gateway-enabled" class="switch-line"><input id="gateway-enabled" v-model="policy.enabled" type="checkbox"> Excel 通道开启</label>
         </div>
+        <p v-if="!policy.enabled" class="muted">
+          Excel 通道已关闭，桥接请求走原生；已配置的模型通道会保留。
+        </p>
+        <RoutingSettings :policy="policy" :models="knownModels" :suffix="pluginInfo?.excelModelSuffix ?? '-excel'" @change="(model, channel) => policy && setChannel(policy, model, channel)" />
+        <details class="gateway-details">
+          <summary>Client Key 与模型的适用范围</summary>
+          <p class="muted">
+            在 CPR「插件管理 → 当前配置 → 绑定」中选择 Client Key、账号组与模型范围。宿主先匹配范围，命中后才调用插件；未命中的请求不应用这里的通道规则。
+          </p>
+          <p class="muted">
+            当前绑定范围共用上述模型默认通道，不等于每个 Key 都有一套独立规则。这里不会保存不生效的 Key 覆盖。
+          </p>
+          <p v-if="Object.keys(policy.key_rules).length" role="status">
+            检测到历史 Key 覆盖配置：数据保留，但当前不会参与路由。
+          </p>
+          <p v-if="optionsError" role="alert">
+            {{ optionsError }}
+          </p>
+        </details>
+      </BaseCard>
+      <BaseCard>
+        <h2 class="section-title">
+          并发与排队
+        </h2>
         <div class="grid">
-          <label>最大并发 <input v-model.number="policy.concurrency" type="number" min="1" max="1024" required></label>
-          <label>超出并发 <select v-model="policy.overflow"><option value="queue">排队</option><option value="reject">拒绝</option></select></label>
-          <label v-if="policy.overflow === 'queue'">队列上限 <input v-model.number="policy.queue_capacity" type="number" min="0" max="10000" required></label>
-          <label v-if="policy.overflow === 'queue'">排队超时 ms <input v-model.number="policy.queue_timeout_ms" type="number" min="1" max="600000" required></label>
+          <label for="gateway-concurrency">Excel 最大并发 <input id="gateway-concurrency" v-model.number="policy.concurrency" type="number" min="1" max="1024" required></label>
+          <label for="gateway-overflow">超出并发 <select id="gateway-overflow" v-model="policy.overflow"><option value="queue">排队</option><option value="reject">拒绝</option></select></label>
+          <label v-if="policy.overflow === 'queue'" for="gateway-queue-capacity">队列上限 <input id="gateway-queue-capacity" v-model.number="policy.queue_capacity" type="number" min="0" max="10000" required></label>
+          <label v-if="policy.overflow === 'queue'" for="gateway-queue-timeout">排队超时（毫秒） <input id="gateway-queue-timeout" v-model.number="policy.queue_timeout_ms" type="number" min="1" max="600000" required></label>
         </div>
-      </BaseCard>
-
-      <BaseCard>
-        <div class="card-title">
-          全局模型通道（所有 Key 的默认）
-          <small>上面的按 Key 规则优先于此处；两者都没设置时跟随后缀。Excel = 无后缀也强制走 Excel；原生 = 带 -excel 后缀也压回原生。</small>
-        </div>
-        <div class="chips">
-          <div v-for="model in knownModels" :key="model" class="chip model" :class="'state-' + modelState(model)">
-            <span class="chip-name">{{ model }}</span>
-            <span class="seg">
-              <button type="button" class="seg-btn" :class="{ active: modelState(model) === 'suffix' }" @click="setModelState(model, 'suffix')">跟随后缀</button>
-              <button type="button" class="seg-btn" :class="{ active: modelState(model) === 'excel' }" @click="setModelState(model, 'excel')">Excel</button>
-              <button type="button" class="seg-btn" :class="{ active: modelState(model) === 'native' }" @click="setModelState(model, 'native')">原生</button>
-            </span>
+        <details class="gateway-details">
+          <summary>Excel 可用账户范围</summary>
+          <p class="muted">
+            允许哪些账户处理 Excel 请求；排除账户不会影响该账户的原生通道，也不会修改 CPR 的账户授权。
+          </p>
+          <div class="chips">
+            <label v-for="account in accountList" :key="account.id" :for="`account-${account.id}`" class="chip account" :class="{ off: !accountAllowed(account.id) }">
+              <input :id="`account-${account.id}`" type="checkbox" :checked="accountAllowed(account.id)" @change="setAccountAllowed(account.id, ($event.target as HTMLInputElement).checked)">
+              <span class="chip-name" :title="account.id">{{ account.id.slice(0, 20) }}…</span><span v-if="!account.enabled" class="chip-state">已停用</span>
+            </label>
           </div>
-          <span v-if="knownModels.length === 0" class="muted">暂无已知模型，发起请求后出现在这里</span>
-        </div>
+        </details>
       </BaseCard>
-
       <BaseCard>
-        <div class="card-title">
-          账户范围
-          <small>哪些账户允许服务 Excel 请求；全部不勾选表示不限</small>
-        </div>
-        <div class="chips">
-          <label v-for="account in accountList" :key="account.id" class="chip account" :class="{ off: !accountAllowed(account.id) }">
-            <input type="checkbox" :checked="accountAllowed(account.id)" @change="setAccountAllowed(account.id, ($event.target as HTMLInputElement).checked)">
-            <span class="chip-name">{{ account.id.slice(0, 20) }}…</span>
-            <span v-if="!account.enabled" class="chip-state">已停用</span>
-          </label>
-          <span v-if="accountList.length === 0" class="muted">暂无账户</span>
-        </div>
-      </BaseCard>
-
-      <BaseCard>
-        <div class="card-title">
-          插件设置（在 CPR 插件实例编辑器中修改）
-          <small v-if="pluginInfo">
-            作用域={{ pluginInfo.isolationScope }} · Excel 后缀已内置（-excel） · 通道开关在本页配置
-          </small>
-        </div>
-      </BaseCard>
-
-      <BaseCard>
-        <div class="card-title">
-          按 Key 使用情况
-          <small>各 Key 最近实际走向。按 Key 授权的两条原生路径：① CPR 插件实例「绑定」的 clientKeyIds（勾选的 Key 可进 Excel 通道，未勾选一律原生透传）；② CPR 原生 Key 模型授权（为 Key 勾选 ±excel 变体即锁定通道）。宿主对插件隐藏 key 身份，此处为只读统计。</small>
-        </div>
-        <div class="chips">
-          <div v-for="key in learnedKeys" :key="key.id" class="chip">
-            <span class="chip-name">{{ key.name }}</span>
-            <span class="chip-state">Excel {{ key.excel }} · 原生 {{ key.native }}</span>
+        <details class="gateway-details">
+          <summary>连接与诊断</summary>
+          <div class="diagnostic-grid">
+            <span>网关连接</span><strong>{{ snapshot ? '正常' : '不可用' }}</strong><span>Key 范围管理</span><strong>CPR 原生插件绑定</strong><span>实例隔离范围</span><code>{{ pluginInfo?.isolationScope ?? '读取中' }}</code>
           </div>
-          <span v-if="learnedKeys.length === 0" class="muted">暂无数据</span>
-        </div>
+          <p class="muted">
+            连接地址、签名密钥路径属于部署配置，不需要日常调整。这里不读取密钥内容；安装、升级、权限授权和故障修复仍在 CPR 插件管理中处理。
+          </p>
+        </details>
       </BaseCard>
-
       <div class="toolbar">
-        <BaseButton type="button" :disabled="saving" @click="save()">
-          {{ saving ? '保存中' : '保存配置' }}
+        <BaseButton type="submit" :disabled="saving">
+          {{ saving ? '保存中' : '保存网关设置' }}
         </BaseButton>
-        <small>有运行中的 Excel 请求时保存会被拒绝，稍后重试</small>
+        <small>运行或排队请求尚未结束时不会修改配置，请待请求结束后保存。</small>
       </div>
-    </template>
+    </form>
   </main>
 </template>
 
 <style>
+.gateway-form {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.section-title {
+  margin: 0 0 10px;
+  font-size: 16px;
+}
+.gateway-details {
+  margin-top: 12px;
+}
+.gateway-details summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+.diagnostic-grid {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 12px 24px;
+  margin: 18px 0;
+  font-size: 13px;
+}
+
 body {
   margin: 0;
 }
