@@ -175,6 +175,7 @@ dependencies = [
  "sha2",
  "thiserror",
  "tokio",
+ "tokio-tungstenite",
  "uuid",
  "zstd",
 ]

@@ -22,6 +22,7 @@ use std::{
 };
 
 mod request_body;
+mod native;
 
 type Events = Pin<Box<dyn Stream<Item = Result<Value, &'static str>> + Send>>;
 type Failure = (StatusCode, axum::Json<Value>);
@@ -391,8 +392,9 @@ async fn events(
     identity: Identity,
     headers: HeaderMap,
     source: Value,
+    native: Option<native::Session>,
 ) -> Result<Events, Failure> {
-    open_events(app, identity, headers, source)
+    open_events(app, identity, headers, source, native)
         .await
         .map(terminal_errors)
 }
@@ -402,6 +404,7 @@ async fn open_events(
     identity: Identity,
     headers: HeaderMap,
     mut source: Value,
+    native: Option<native::Session>,
 ) -> Result<Events, Failure> {
     let started = Instant::now();
     // 未签名连接：绑定未命中的 key，仅原生透传；-excel 后缀在此还原避免上游拒绝。
@@ -413,7 +416,7 @@ async fn open_events(
                 .and_then(|m| m.strip_suffix(&app.suffix))
                 .filter(|m| !m.is_empty())
                 .map(str::to_owned);
-            return unsigned_events(app, headers, source, model).await;
+            return unsigned_events(app, headers, source, model, native).await;
         }
         Identity::Signed(ctx) => *ctx,
     };
@@ -531,6 +534,22 @@ async fn open_events(
             }
             object.insert("stream".into(), json!(true));
         }
+        if let Some(session) = native {
+            let config = read_config(&app)?;
+            let route = config.accounts.get(&ctx.account).ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "account is not configured for this bridge"))?.clone();
+            let mut upstream = session.events(client, headers, route, source).await.map_err(|error| { lease.fail("native WebSocket open failed"); error })?;
+            return Ok(Box::pin(async_stream::stream! {
+                while let Some(event) = upstream.next().await {
+                    match &event {
+                        Ok(event) if excel::stream::is_terminal(event) || event["type"] == "error" => lease.terminal(event),
+                        Err(error) => lease.fail(error),
+                        _ => {}
+                    }
+                    yield event;
+                }
+            }));
+        }
+        native::http_continuation(&source)?;
         body = source;
     }
     let endpoint = if ctx.excel {
@@ -631,6 +650,7 @@ async fn unsigned_events(
     headers: HeaderMap,
     mut source: Value,
     stripped_model: Option<String>,
+    native: Option<native::Session>,
 ) -> Result<Events, Failure> {
     let model = match stripped_model {
         Some(model) => model,
@@ -669,6 +689,23 @@ async fn unsigned_events(
             return Err((status, error));
         }
     };
+    if let Some(session) = native {
+        let config = read_config(&app)?;
+        let route = unsigned_route(&config, account_id.as_deref())?.clone();
+        let mut events = session.events(client, upstream, route, source).await.map_err(|error| { lease.fail("native WebSocket open failed"); error })?;
+        app.control.running(&request_id, 0);
+        return Ok(Box::pin(async_stream::stream! {
+            while let Some(event) = events.next().await {
+                match &event {
+                    Ok(event) if excel::stream::is_terminal(event) || event["type"] == "error" => app.control.finish_unsigned(&request_id, event),
+                    Err(error) => lease.fail(error),
+                    _ => {}
+                }
+                yield event;
+            }
+        }));
+    }
+    native::http_continuation(&source)?;
     let response = match client
         .post("https://chatgpt.com/backend-api/codex/responses")
         .headers(upstream)
@@ -723,6 +760,32 @@ async fn unsigned_events(
         if !terminal { lease.fail("upstream ended without a terminal event"); yield Err("upstream ended without a terminal event"); }
     }))
 }
+/// Model discovery uses the same authenticated account and configured egress.
+/// Only this fixed upstream resource is forwarded; never an arbitrary URL.
+async fn models(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+) -> Result<Response, Failure> {
+    let identity = context(&headers, &app)?;
+    let client = match identity {
+        Identity::Signed(ctx) => client(&app, &ctx)?,
+        Identity::Unsigned => unsigned_client(&app, headers.get("chatgpt-account-id").and_then(|value| value.to_str().ok()))?,
+    };
+    let mut upstream = upstream_headers(&headers, false)?;
+    upstream.insert("accept", "application/json".parse().unwrap());
+    let mut url = reqwest::Url::parse("https://chatgpt.com/backend-api/codex/models").unwrap();
+    url.set_query(query.as_deref());
+    let response = client.get(url).headers(upstream).send().await
+        .map_err(|_| fail(StatusCode::BAD_GATEWAY, "native model directory connection failed"))?;
+    let status = response.status();
+    let mut output = HeaderMap::new();
+    for name in ["content-type", "etag", "cache-control"] {
+        if let Some(value) = response.headers().get(name) { output.insert(name, value.clone()); }
+    }
+    Ok((status, output, Body::from_stream(response.bytes_stream())).into_response())
+}
+
 async fn http(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
@@ -735,7 +798,7 @@ async fn http(
     })
     .await
     .map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "request decoding failed"))??;
-    let mut stream = events(app, identity, headers, source).await?;
+    let mut stream = events(app, identity, headers, source, None).await?;
     let bytes = async_stream::stream! {
         while let Some(event) = stream.next().await {
             match event {
@@ -773,6 +836,7 @@ async fn next_data(socket: &mut WebSocket) -> Option<Result<Message, axum::Error
     }
 }
 async fn websocket(mut socket: WebSocket, app: Arc<App>, identity: Identity, headers: HeaderMap) {
+    let native = native::Session::default();
     while let Some(Ok(message)) = next_data(&mut socket).await {
         let Message::Text(text) = message else {
             if matches!(message, Message::Close(_)) {
@@ -793,7 +857,7 @@ async fn websocket(mut socket: WebSocket, app: Arc<App>, identity: Identity, hea
         }
         // 每个连接严格串行；发送方断开时立即丢弃上游 future 和响应流。
         let opened = tokio::select! {
-            result = events(app.clone(), identity.clone(), headers.clone(), source) => result,
+            result = events(app.clone(), identity.clone(), headers.clone(), source, Some(native.clone())) => result,
             _ = next_data(&mut socket) => return,
         };
         match opened {
@@ -917,6 +981,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/healthz", get(|| async { StatusCode::NO_CONTENT }))
         .route("/_control/{operation}", post(control))
         .route("/backend-api/codex/responses", post(http).get(ws))
+        .route("/backend-api/codex/models", get(models))
         .layer(DefaultBodyLimit::max(request_body::MAX_BODY_BYTES))
         .with_state(app);
     let listener = tokio::net::TcpListener::bind(

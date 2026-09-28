@@ -21,5 +21,7 @@ async-stream = "0.3"
 hmac = "0.12"
 zstd = { version = "0.13", default-features = false }
 
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
+
 [workspace]
 members = ["plugin"]
