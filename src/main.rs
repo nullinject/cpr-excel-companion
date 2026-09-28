@@ -622,13 +622,20 @@ async fn open_events(
                 if first_event { eprintln!("bridge timing {} first_event_ms={}", ctx.request_id, started.elapsed().as_millis()); first_event = false; }
                 if matches!(last_event.as_str(), "error" | "response.failed" | "response.incomplete") {
                     let (code, _, _) = excel::stream::failure_details(&event);
-                    eprintln!("bridge upstream_terminal {} event={} code={} reason={} elapsed_ms={}",
-                        ctx.request_id, last_event, code, excel::stream::incomplete_reason(&event), started.elapsed().as_millis());
+                    eprintln!("bridge upstream_terminal {} event={} code={} reason={} elapsed_ms={} error_fields={}",
+                        ctx.request_id, last_event, code, excel::stream::incomplete_reason(&event), started.elapsed().as_millis(), excel::stream::failure_diagnostics(&event));
                 }
                 let output = if ctx.excel { translator.event(event.clone()) } else { Ok(vec![event.clone()]) };
                 if output.is_err() { capture_tool_failure(&app, &ctx, &event); eprintln!("bridge timing {} translation_failed_ms={} last_event={}", ctx.request_id, started.elapsed().as_millis(), last_event); }
                 let output = match output { Ok(v) => v, Err(e) => { lease.fail(e); eprintln!("bridge stream {} failed: {e}", ctx.request_id); yield Err(e); return; } };
-                for event in output {
+                for mut event in output {
+                    // A client can quote this ID without exposing any upstream error text.
+                    if ctx.excel && event["type"] == "response.failed" {
+                        if let Some(message) = event.pointer("/response/error/message").and_then(Value::as_str) {
+                            event["response"]["error"]["message"] = json!(format!("{message} [request_id={}]", ctx.request_id));
+                            event["response"]["error"]["request_id"] = json!(ctx.request_id);
+                        }
+                    }
                     terminal = excel::stream::is_terminal(&event);
                     if terminal { lease.terminal(&event); eprintln!("bridge timing {} terminal_ms={} event={}", ctx.request_id, started.elapsed().as_millis(), event["type"]); }
                     if terminal && ctx.excel {

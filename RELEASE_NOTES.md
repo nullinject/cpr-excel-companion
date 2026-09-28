@@ -1,3 +1,9 @@
+## Bridge hotfix — 2026-09-28
+
+- Fix streamed failure classification: an unknown provider code no longer hides a recognized error type; support flat error code/type fields.
+- Add a request ID to Excel failed responses and log safe error-field shapes. Keep raw error text and credentials out of responses and diagnostics.
+- Keep failed streams failed; do not replay partially delivered output or change native routing, authentication, or plugin configuration.
+
 ## 0.8.7 · 2026-09-28
 
 - 修复请求监控在 Token 用量为 null 时整页渲染失败；未知用量显示为「—」，真实零用量仍显示为 0。

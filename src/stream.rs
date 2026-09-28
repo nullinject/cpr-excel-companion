@@ -65,26 +65,60 @@ impl Decoder {
 /// Only fixed, known error codes leave the bridge; raw upstream error text may
 /// contain prompts or credentials. Preserve the classification so CPR can apply
 /// its existing recovery policy without retrying a partially delivered response.
+const ERROR_FIELDS: [&str; 8] = [
+    "/response/error/code", "/error/code", "/code", "/error_code",
+    "/response/error/type", "/error/type", "/error_type", "/response/error_type",
+];
+
 pub fn failure_details(event: &Value) -> (&'static str, &'static str, &'static str) {
-    let code = ["/response/error/code", "/error/code", "/code", "/response/error/type", "/error/type"]
-        .into_iter().find_map(|path| event.pointer(path).and_then(Value::as_str));
-    match code {
-        Some("rate_limit_exceeded") => ("rate_limit_exceeded", "rate_limit_error", "Excel upstream rate limit exceeded"),
-        Some("usage_limit_reached") => ("usage_limit_reached", "usage_limit_reached", "Excel upstream account usage limit reached"),
-        Some("insufficient_quota") => ("insufficient_quota", "insufficient_quota", "Excel upstream quota exhausted"),
-        Some("context_length_exceeded") => ("context_length_exceeded", "invalid_request_error", "Excel upstream context length exceeded; shorten or compact the conversation"),
-        Some("server_error") => ("server_error", "server_error", "Excel upstream server error"),
-        Some("internal_server_error") => ("internal_server_error", "server_error", "Excel upstream internal server error"),
-        Some("temporarily_unavailable") => ("temporarily_unavailable", "server_error", "Excel upstream temporarily unavailable"),
-        Some("overloaded") => ("overloaded", "server_error", "Excel upstream overloaded"),
-        Some("invalid_request_error") => ("invalid_request_error", "invalid_request_error", "Excel upstream rejected the request"),
-        Some("invalid_api_key") => ("invalid_api_key", "authentication_error", "Excel upstream authentication failed"),
-        Some("authentication_error") => ("authentication_error", "authentication_error", "Excel upstream authentication failed"),
-        Some("permission_denied") => ("permission_denied", "permission_error", "Excel upstream permission denied"),
-        Some("model_not_found") => ("model_not_found", "invalid_request_error", "Excel upstream model unavailable"),
-        _ => ("excel_upstream_failed", "server_error", "Excel upstream reported a failure (unclassified; see bridge event diagnostics)"),
-    }
+    // An unfamiliar provider code must not hide a recognized error type.
+    ERROR_FIELDS.into_iter()
+        .filter_map(|path| event.pointer(path).and_then(Value::as_str))
+        .find_map(known_failure)
+        .unwrap_or(("excel_upstream_failed", "server_error",
+            "Excel upstream returned an error without a recognized error code; the response did not complete"))
 }
+
+fn known_failure(code: &str) -> Option<(&'static str, &'static str, &'static str)> {
+    Some(match code {
+        "rate_limit_exceeded" | "rate_limit_error" => ("rate_limit_exceeded", "rate_limit_error", "Excel upstream rate limit exceeded"),
+        "usage_limit_reached" => ("usage_limit_reached", "usage_limit_reached", "Excel upstream account usage limit reached"),
+        "insufficient_quota" => ("insufficient_quota", "insufficient_quota", "Excel upstream quota exhausted"),
+        "context_length_exceeded" => ("context_length_exceeded", "invalid_request_error", "Excel upstream context length exceeded; shorten or compact the conversation"),
+        "server_error" => ("server_error", "server_error", "Excel upstream server error"),
+        "internal_server_error" => ("internal_server_error", "server_error", "Excel upstream internal server error"),
+        "temporarily_unavailable" => ("temporarily_unavailable", "server_error", "Excel upstream temporarily unavailable"),
+        "overloaded" | "overloaded_error" => ("overloaded", "server_error", "Excel upstream overloaded"),
+        "invalid_request_error" => ("invalid_request_error", "invalid_request_error", "Excel upstream rejected the request"),
+        "invalid_api_key" => ("invalid_api_key", "authentication_error", "Excel upstream authentication failed"),
+        "authentication_error" => ("authentication_error", "authentication_error", "Excel upstream authentication failed"),
+        "permission_denied" | "permission_error" => ("permission_denied", "permission_error", "Excel upstream permission denied"),
+        "model_not_found" => ("model_not_found", "invalid_request_error", "Excel upstream model unavailable"),
+        _ => return None,
+    })
+}
+
+/// Safe diagnostic shape only: no arbitrary codes, messages, prompts or credentials.
+pub fn failure_diagnostics(event: &Value) -> Value {
+    let mut fields = serde_json::Map::new();
+    for path in ERROR_FIELDS.into_iter().chain([
+        "/error", "/message", "/error/message", "/response/error", "/response/error/message",
+    ]) {
+        if let Some(value) = event.pointer(path) {
+            let shape = match value {
+                Value::Null => "null", Value::Bool(_) => "boolean", Value::Number(_) => "number",
+                Value::String(_) => "string", Value::Array(_) => "array", Value::Object(_) => "object",
+            };
+            let mut detail = json!({"shape": shape});
+            if let Some((code, _, _)) = value.as_str().and_then(known_failure) {
+                detail["recognized_code"] = json!(code);
+            }
+            fields.insert(path.into(), detail);
+        }
+    }
+    json!(fields)
+}
+
 pub fn incomplete_reason(event: &Value) -> &'static str {
     match event.pointer("/response/incomplete_details/reason").and_then(Value::as_str) {
         Some("max_output_tokens") => "max_output_tokens",
@@ -353,6 +387,27 @@ mod tests {
         assert_eq!(failure_details(&event).0,"server_error");
         assert!(is_terminal(&event));
         assert!(!is_terminal(&json!({"type":"response.output_text.delta"})));
+    }
+    #[test]
+    fn failure_uses_recognized_type_after_unknown_code_and_supports_flat_errors() {
+        for event in [
+            json!({"type":"error","error":{"code":"provider_failure_v2","type":"rate_limit_error"}}),
+            json!({"type":"error","error_type":"rate_limit_exceeded"}),
+            json!({"type":"error","error_code":"rate_limit_exceeded"}),
+        ] {
+            assert_eq!(failure_details(&event).0, "rate_limit_exceeded");
+        }
+        let event=json!({"type":"error","error":{"code":"model_not_found","type":"server_error"}});
+        assert_eq!(failure_details(&event).0, "model_not_found");
+    }
+    #[test]
+    fn diagnostics_explain_shape_without_echoing_private_fields() {
+        let event=json!({"type":"error","message":"private prompt", "error":{"code":"private-token","type":"rate_limit_error","message":"Bearer private-token"}});
+        let diagnostic=failure_diagnostics(&event);
+        assert_eq!(diagnostic["/error/code"]["shape"],"string");
+        assert_eq!(diagnostic["/error/type"]["recognized_code"],"rate_limit_exceeded");
+        assert!(!diagnostic.to_string().contains("private"));
+        assert!(!diagnostic.to_string().contains("Bearer"));
     }
     #[test]
     fn tool_call_is_emitted_once_and_preserves_original() {
