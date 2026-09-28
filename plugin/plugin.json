@@ -3,11 +3,11 @@
   "name": "excel-companion",
   "publisher": "nullinject",
   "displayName": "Excel Companion",
-  "version": "0.8.4",
+  "version": "0.8.5",
   "description": "官方 CPR 的 Excel 桥接适配器（数据面桥接 + 进程内控制面）",
   "license": "Unlicense",
   "engines": {
-    "codex-proxy-rs": ">=3.16.0, <3.17.0"
+    "codex-proxy-rs": ">=3.16.0, <4.0.0"
   },
   "main": "bin/cpr-excel-companion-plugin",
   "runtime": "trustedProcess",
