@@ -362,26 +362,28 @@ fn terminal_errors(mut stream: Events) -> Events {
     Box::pin(async_stream::stream! {
         let mut response_id = "resp_excel_failed".to_owned();
         let mut sequence = 0_u64;
-        while let Some(event) = stream.next().await {
-            match event {
-                Ok(event) => {
+        let error = loop {
+            match stream.next().await {
+                Some(Ok(event)) => {
                     if let Some(id) = event.pointer("/response/id").and_then(Value::as_str) {
                         response_id = id.to_owned();
                     }
                     if let Some(number) = event["sequence_number"].as_u64() {
                         sequence = number.saturating_add(1);
                     }
+                    let terminal = excel::stream::is_terminal(&event);
                     yield Ok(event);
+                    // A late socket close after a valid terminal is not another failure.
+                    if terminal { return; }
                 }
-                Err(error) => {
-                    // Stream errors are static bridge diagnostics, never upstream payloads.
-                    yield Ok(json!({"type":"response.failed","sequence_number":sequence,
-                        "response":{"id":response_id,"object":"response","status":"failed",
-                        "output":[],"error":{"type":"server_error","code":"excel_bridge_stream_error","message":error}}}));
-                    return;
-                }
+                Some(Err(error)) => break error,
+                None => break "upstream ended without a terminal event",
             }
-        }
+        };
+        // Only static bridge diagnostics, never arbitrary upstream error payloads.
+        yield Ok(json!({"type":"response.failed","sequence_number":sequence,
+            "response":{"id":response_id,"object":"response","status":"failed",
+            "output":[],"error":{"type":"server_error","code":"excel_bridge_stream_error","message":error}}}));
     })
 }
 async fn events(
@@ -599,11 +601,16 @@ async fn open_events(
             for event in input {
                 last_event = event["type"].as_str().unwrap_or("unknown").to_owned();
                 if first_event { eprintln!("bridge timing {} first_event_ms={}", ctx.request_id, started.elapsed().as_millis()); first_event = false; }
+                if matches!(last_event.as_str(), "error" | "response.failed" | "response.incomplete") {
+                    let (code, _, _) = excel::stream::failure_details(&event);
+                    eprintln!("bridge upstream_terminal {} event={} code={} reason={} elapsed_ms={}",
+                        ctx.request_id, last_event, code, excel::stream::incomplete_reason(&event), started.elapsed().as_millis());
+                }
                 let output = if ctx.excel { translator.event(event.clone()) } else { Ok(vec![event.clone()]) };
                 if output.is_err() { capture_tool_failure(&app, &ctx, &event); eprintln!("bridge timing {} translation_failed_ms={} last_event={}", ctx.request_id, started.elapsed().as_millis(), last_event); }
                 let output = match output { Ok(v) => v, Err(e) => { lease.fail(e); eprintln!("bridge stream {} failed: {e}", ctx.request_id); yield Err(e); return; } };
                 for event in output {
-                    terminal = matches!(event["type"].as_str(), Some("response.completed"|"response.failed"|"response.incomplete"));
+                    terminal = excel::stream::is_terminal(&event);
                     if terminal { lease.terminal(&event); eprintln!("bridge timing {} terminal_ms={} event={}", ctx.request_id, started.elapsed().as_millis(), event["type"]); }
                     if terminal && ctx.excel {
                         excel::history::save(&scope, &original_input, &event["response"]);
@@ -614,6 +621,7 @@ async fn open_events(
                 }
             }
         }
+        if let Err(e) = decoder.finish() { lease.fail(e); yield Err(e); return; }
         if !terminal { lease.fail("upstream ended without a terminal event"); eprintln!("bridge EOF {} elapsed_ms={} last_event={}", ctx.request_id, started.elapsed().as_millis(), last_event); yield Err("upstream ended without a terminal event"); }
     }))
 }
@@ -694,16 +702,16 @@ async fn unsigned_events(
         loop {
             let chunk = match tokio::time::timeout(Duration::from_secs(15), wire.next()).await {
                 Ok(Some(Ok(c))) => c,
-                Ok(Some(Err(_))) => { yield Err("upstream stream interrupted"); return; }
+                Ok(Some(Err(_))) => { lease.fail("upstream stream interrupted"); yield Err("upstream stream interrupted"); return; }
                 Ok(None) => break,
                 Err(_elapsed) => {
                     yield Ok(json!({"type":"bridge.comment","text":"keepalive"}));
                     continue;
                 }
             };
-            let input = match decoder.push(&chunk) { Ok(v) => v, Err(e) => { yield Err(e); return; } };
+            let input = match decoder.push(&chunk) { Ok(v) => v, Err(e) => { lease.fail(e); yield Err(e); return; } };
             for event in input {
-                terminal = matches!(event["type"].as_str(), Some("response.completed"|"response.failed"|"response.incomplete"));
+                terminal = excel::stream::is_terminal(&event);
                 if terminal {
                     app.control.finish_unsigned(&request_id, &event);
                 }
@@ -711,7 +719,8 @@ async fn unsigned_events(
                 if terminal { return; }
             }
         }
-        if !terminal { yield Err("upstream ended without a terminal event"); }
+        if let Err(e) = decoder.finish() { lease.fail(e); yield Err(e); return; }
+        if !terminal { lease.fail("upstream ended without a terminal event"); yield Err("upstream ended without a terminal event"); }
     }))
 }
 async fn http(
@@ -938,6 +947,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod terminal_error_tests {
     use super::*;
+    #[tokio::test]
+    async fn terminal_wrapper_ignores_errors_after_success() {
+        let source: Events = Box::pin(futures_util::stream::iter(vec![
+            Ok(json!({"type":"response.completed","sequence_number":8,"response":{"id":"resp_done","status":"completed","output":[]}})),
+            Err("trailing transport failure"),
+        ]));
+        let output=terminal_errors(source).collect::<Vec<_>>().await;
+        assert_eq!(output.len(),1);
+        assert_eq!(output[0].as_ref().unwrap()["type"],"response.completed");
+    }
+    #[tokio::test]
+    async fn terminal_wrapper_marks_eof_and_retains_identity_and_sequence() {
+        let source: Events = Box::pin(futures_util::stream::iter(vec![
+            Ok(json!({"type":"response.created","sequence_number":6,"response":{"id":"resp_open","status":"in_progress"}}))
+        ]));
+        let output=terminal_errors(source).collect::<Vec<_>>().await;
+        assert_eq!(output.len(),2);
+        let terminal=output[1].as_ref().unwrap();
+        assert_eq!(terminal["type"],"response.failed");
+        assert_eq!(terminal["response"]["id"],"resp_open");
+        assert_eq!(terminal["sequence_number"],7);
+    }
     #[tokio::test]
     async fn pooled_client_reuses_connection_and_does_not_bypass_changed_routes() {
         use axum::extract::ConnectInfo;
