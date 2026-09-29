@@ -110,6 +110,9 @@ impl Control {
         let i = self.lock();
         json!({"policy":i.saved.policy,"version":i.saved.version,"active":i.gate.active(),"waiting":i.gate.waiting(),"records":i.records})
     }
+    pub fn policy_errors_as_server_error(&self) -> bool {
+        self.lock().saved.policy.policy_errors_as_server_error
+    }
     pub fn save(
         &self,
         policy: Policy,

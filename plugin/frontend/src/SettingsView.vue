@@ -25,6 +25,10 @@ const emit = defineEmits<{ save: [], discard: [], reloadCatalogs: [] }>()
 const policy = defineModel<Policy>('policy', { required: true })
 const accountSearch = ref('')
 const section = ref('routing')
+const policyErrorsAsServerError = computed({
+  get: () => policy.value.policy_errors_as_server_error ?? false,
+  set: (value: boolean) => { policy.value.policy_errors_as_server_error = value },
+})
 const sections = [
   { id: 'routing', label: '模型路由' },
   { id: 'capacity', label: '执行限制' },
@@ -140,6 +144,17 @@ const selectedCount = computed(
                     step="1"
                     required
                   ><small>同时执行的请求数，1–1024</small>
+                </div>
+              </label>
+              <label class="gw-field" for="gw-policy-server-error">
+                <span>Policy 错误按普通服务错误处理</span>
+                <div>
+                  <input
+                    id="gw-policy-server-error"
+                    v-model="policyErrorsAsServerError"
+                    type="checkbox"
+                    role="switch"
+                  ><small>默认关闭。开启后，Excel 通道的 policy 错误转换为 server_error，由客户端或宿主现有机制决定重试，可能产生重复请求和额外计费。桥接不自行重试，原始错误仍记入服务器日志。</small>
                 </div>
               </label>
               <label class="gw-field" for="gw-overflow">

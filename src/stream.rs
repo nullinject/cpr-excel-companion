@@ -107,6 +107,19 @@ fn known_failure(code: &str) -> Option<(&'static str, &'static str, &'static str
     })
 }
 
+/// Optional public classification only. Call after recording the original error.
+/// Never infer a policy code from arbitrary upstream message text.
+pub fn policy_server_error(event: &Value) -> Option<Value> {
+    let policy = matches!(failure_details(event).0,
+        "cyber_policy" | "bio_policy" | "misalignment_policy_violation" | "content_filter")
+        || (event["type"] == "response.incomplete" && incomplete_reason(event) == "content_filter");
+    policy.then(|| json!({
+        "code": "server_error",
+        "type": "server_error",
+        "message": "Excel upstream server error"
+    }))
+}
+
 /// Safe diagnostic shape only: no arbitrary codes, messages, prompts or credentials.
 pub fn failure_diagnostics(event: &Value) -> Value {
     let mut fields = serde_json::Map::new();

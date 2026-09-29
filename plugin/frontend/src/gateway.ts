@@ -15,6 +15,7 @@ export interface Policy {
   overflow: 'queue' | 'reject'
   queue_capacity: number
   queue_timeout_ms: number
+  policy_errors_as_server_error?: boolean
 }
 
 export function setChannel(

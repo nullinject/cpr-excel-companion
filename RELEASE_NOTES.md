@@ -1,3 +1,9 @@
+## 未发布 · 2026-09-29
+
+- 撤销 `0bd540f` 引入的提示词改写和桥接策略重试循环。
+- 新增默认关闭的 `policy_errors_as_server_error`：仅将 Excel 通道的明确 policy 错误映射为普通 `server_error`，交由调用方现有机制决定重试；原始诊断日志、usage 与部分输出保留，桥接不额外发请求。
+- 此项为源码改动，尚未部署或发布新安装包。安装应使用宿主正式接口，不直接写插件数据库记录。
+
 ## Bridge hotfix — 2026-09-28
 
 - Fix streamed failure classification: an unknown provider code no longer hides a recognized error type; support flat error code/type fields.
@@ -61,4 +67,4 @@
 生产实测通过：原生透传、Excel 非流式（sol/terra）、Excel 流式（astra，WebSocket 上游）、model_requests 用量与计费、侧边栏观察归并。`cargo test --workspace --locked` 与 `cargo clippy -D warnings` 全绿；前端 pnpm build / lint 通过。
 ## 0.8.8 · 2026-09-28
 
-- Added opt-in safe prompt translation for the latest user message and bounded retry for recognized pre-output policy rejections.
+- 原提示词改写与桥接内策略重试实现已于 2026-09-29 撤销，请勿依据此旧条目启用或重新安装该实验版本。

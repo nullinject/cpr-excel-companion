@@ -6,6 +6,12 @@
 
 ## 宿主兼容范围
 
+### 可选 Policy 错误分类（源码功能，尚未部署）
+
+在「Excel 网关 → 执行限制」开启 `policy_errors_as_server_error`，可将 Excel 通道的 `cyber_policy`、`bio_policy`、`misalignment_policy_violation`、`content_filter` 转为普通 `server_error`：非 2xx HTTP 错误返回 HTTP 500；流式错误输出 `response.failed`，`response.incomplete/content_filter` 也转换为失败终态。默认关闭，缺少此字段的旧配置保持原行为；原生通道、认证错误、限流、`invalid_prompt` 和其他未完成原因不变。
+
+这只是错误分类转换，客户端/宿主是否重试及重试上限取决于其既有逻辑。桥接不增加请求、不改写提示词、不切换账户，已有输出和 usage 不丢弃；重试可能重复计费或重复执行已输出的工具操作，开启前应确认调用方的重试行为。转换前原始错误仍由现有私有脱敏日志保存。部署须同时更新桥接和插件前端；旧桥接会拒绝未知设置，不会静默启用。不要通过直接写数据库或替换运行时临时插件目录安装，使用宿主正式安装/版本切换接口。
+
 插件不再把宿主锁在 3.16.x：清单接受 `>=3.16.0, <4.0.0` 的稳定版本，避免同主版本升级时因过窄声明直接停用。此范围是兼容策略，不代表每个未来 3.x 版本都已实测；协议版本、能力声明、权限与平台校验仍由宿主执行。4.x 和预发布宿主需单独验证。此次仅调整插件安装包与兼容性测试，不更改桥接数据面，也不申请新增预算管理或账号权限。
 
 ## v0.6.2 修复：HTTP 请求压缩
@@ -23,7 +29,7 @@ CPR 的 Codex HTTP 上游会发送 `Content-Encoding: zstd`。此前桥接直接
 原提示 “Excel upstream did not complete the response” 由桥接在收到上游 error、response.failed 或 response.incomplete 时统一生成，并不等同于一次 TCP 断线。旧逻辑丢弃了错误分类、未完成原因和终态 usage，无法据此判断线上是限流、上下文超限还是服务错误。
 
 - 对已知错误码保留分类，并生成固定脱敏说明；不转发原始错误正文、提示词或凭据。不认识的代码仍标为未分类，不能据此推断根因。
-- 2026-09-28 热修复：保留 cyber_policy、bio_policy、misalignment_policy_violation、invalid_prompt、content_filter、server_overloaded、usage_not_included。策略错误继续失败关闭，不转换成成功，也不触发换账号或自动重放；cyber_policy 路径已用真实 Codex 0.157.1 配合同输入 SSE 探针验证：直接显示策略原因，不再因分类丢失误报断流并重连。其余新增映射由回归测试覆盖；历史未分类事件不能追溯判定为某一种策略错误。
+- 2026-09-28 热修复：默认保留 cyber_policy、bio_policy、misalignment_policy_violation、invalid_prompt、content_filter、server_overloaded、usage_not_included。策略错误继续返回失败、不伪造成功，桥接不自动重放；默认关闭的新分类选项见上文。cyber_policy 原分类路径已用真实 Codex 0.157.1 配合同输入 SSE 探针验证：直接显示策略原因，不再因分类丢失误报断流并重连。其余新增映射由回归测试覆盖；历史未分类事件不能追溯判定为某一种策略错误。
 - 保留 response.incomplete、max_output_tokens / content_filter 原因、已有文本和 usage；不伪造完成，也不把未完成工具参数发送成可执行调用。
 - 保留已创建的 response ID；有效终态后不再追加第二个失败；无终态 EOF 和截断 SSE 明确失败。原生链路的顶层 error 也作为终态处理。
 - 监控记录保留安全错误码及未完成原因，宿主没有新错误码时不清空已记录的原因；补充仅含事件类型、已知分类、耗时的日志，不记录请求正文或原始错误。

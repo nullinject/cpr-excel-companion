@@ -67,6 +67,9 @@ pub struct Policy {
     pub overflow: Overflow,
     pub queue_capacity: usize,
     pub queue_timeout_ms: u64,
+    /// Excel-only error classification; retry decisions remain with the caller.
+    #[serde(default)]
+    pub policy_errors_as_server_error: bool,
 }
 impl Default for Policy {
     fn default() -> Self {
@@ -81,6 +84,7 @@ impl Default for Policy {
             overflow: Overflow::Queue,
             queue_capacity: 32,
             queue_timeout_ms: 120_000,
+            policy_errors_as_server_error: false,
         }
     }
 }
