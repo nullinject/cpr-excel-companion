@@ -1,12 +1,12 @@
 # CPR Excel Companion
 
-**v0.8.5 插件 + v0.8.4 独立桥接：宿主版本声明为 CPR >=3.16.0、<4.0.0。数据面经 CPR 原生 Provider 执行，保留计费与用量统计链路；验收范围和已知限制见下文。**
+**v0.8.9 插件 + v0.8.4 独立桥接：宿主版本声明为 CPR >=3.16.0、<4.0.0。数据面经 CPR 原生 Provider 执行，保留计费与用量统计链路；验收范围和已知限制见下文。**
 
 协议转换移植自 [Kaixxrua/excel-codex-bridge](https://github.com/Kaixxrua/excel-codex-bridge)。无需修改 CPR 源码；由插件、桥接服务与上游路由三部分组成。
 
 ## 宿主兼容范围
 
-### 可选 Policy 错误分类（源码功能，尚未部署）
+### v0.8.9：可选 Policy 错误分类
 
 在「Excel 网关 → 执行限制」开启 `policy_errors_as_server_error`，可将 Excel 通道的 `cyber_policy`、`bio_policy`、`misalignment_policy_violation`、`content_filter` 转为普通 `server_error`：非 2xx HTTP 错误返回 HTTP 500；流式错误输出 `response.failed`，`response.incomplete/content_filter` 也转换为失败终态。默认关闭，缺少此字段的旧配置保持原行为；原生通道、认证错误、限流、`invalid_prompt` 和其他未完成原因不变。
 
@@ -194,7 +194,7 @@ pnpm build
 pnpm lint
 ```
 
-Rust 1.97.1，Node >=24 / pnpm 12.6.0。打包：官方 `cpr-plugin package --manifest plugin/plugin.json --binary target/release/cpr-excel-companion-plugin --target x86_64-unknown-linux-gnu --resource-map web=frontend/dist --output-dir plugin/dist`（CLI 与 vendored SDK 同为 v3.16.0 提交 0534dd8）。
+Rust 1.97.1，Node >=24 / pnpm 12.6.0。打包：官方 `cpr-plugin package --manifest plugin/plugin.json --binary target/release/cpr-excel-companion-plugin --target x86_64-unknown-linux-gnu --resource-map web=frontend/dist --output-dir plugin/dist`（vendored SDK 保持 v3.16.0 提交 0534dd8；0.8.9 使用官方 CLI d310286 打包，并通过 CPR 3.16.0 宿主安装包校验）。
 
 默认不记录请求正文、文件内容或令牌；上游的可选短时工具失败诊断会将有限工具事件写入私有文件，仅在操作员显式配置后生效。拒绝远程图片 URL；内联附件有大小限制。未包含原项目的登录发现功能或 OfficeJS 执行器。
 
