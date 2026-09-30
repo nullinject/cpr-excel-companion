@@ -33,10 +33,15 @@ fn uses_current_host_contracts_without_legacy_capabilities() {
     let value: serde_json::Value =
         serde_json::from_slice(include_bytes!("../plugin.json")).unwrap();
     assert_eq!(value["manifestVersion"], 2);
-    assert_eq!(value["contributes"]["middleware"]["version"], 3);
+    assert_eq!(value["contributes"]["upstream_adapter"]["version"], 1);
     assert!(value.get("permissions").is_none());
     assert!(value["contributes"].get("observer").is_some());
-    for legacy in ["usage", "request_lifecycle", "web_socket_observer"] {
+    for legacy in [
+        "middleware",
+        "usage",
+        "request_lifecycle",
+        "web_socket_observer",
+    ] {
         assert!(value["contributes"].get(legacy).is_none());
     }
 }

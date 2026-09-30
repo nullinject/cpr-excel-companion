@@ -3,8 +3,8 @@
   "name": "excel-companion",
   "publisher": "nullinject",
   "displayName": "Excel Companion",
-  "version": "0.9.0",
-  "description": "Excel 通道适配插件。日常监控与路由设置请进入侧栏「Excel 网关」；此处只配置宿主连接。",
+  "version": "0.10.1",
+  "description": "Excel 通道协议转换、监控与路由设置。出站、账号、代理及结算由 CPR 管理，无需独立网关。",
   "license": "Unlicense",
   "engines": {
     "codex-proxy-rs": ">=3.18.2, <3.19.0"
@@ -12,56 +12,38 @@
   "main": "bin/cpr-excel-companion-plugin",
   "runtime": "trustedProcess",
   "contributes": {
-    "middleware": {
-      "stages": [
-        "attempt"
-      ],
+    "management": {},
+    "observer": {},
+    "upstream_adapter": {
+      "version": 1,
       "inputFormats": [
         "openai"
       ],
       "outputFormats": [
         "openai"
-      ],
-      "version": 3
-    },
-    "management": {},
-    "observer": {}
+      ]
+    }
   },
   "configurationSchema": {
     "type": "object",
+    "title": "插件数据与页面",
     "properties": {
-      "secretFile": {
+      "policyFile": {
         "type": "string",
-        "default": "/run/secrets/excel-bridge.key",
-        "title": "签名密钥文件",
-        "description": "服务器上的绝对文件路径，须与桥接服务共享同一签名密钥。填写文件路径，不要填写密钥内容；页面不会读取或显示该文件。"
-      },
-      "isolationScope": {
-        "type": "string",
-        "minLength": 1,
-        "maxLength": 256,
-        "title": "插件隔离标识",
-        "description": "为此插件实例设置一个稳定、唯一的标识。它不是 Client Key ID，也不选择用户 Key；Key 与模型适用范围由 CPR 插件绑定管理。"
-      },
-      "bridgeControlUrl": {
-        "type": "string",
-        "default": "http://127.0.0.1:8089/_control",
-        "title": "桥接控制地址",
-        "description": "插件进程访问桥接服务的内部 HTTP 地址，包含 /_control。容器部署时，127.0.0.1 指插件所在容器；请填写实际可达的内网地址，不要使用公网转发。"
+        "title": "策略文件",
+        "description": "插件进程可读写的绝对路径；目录需提前创建。迁移时复制旧网关的策略文件。",
+        "default": "/app/.runtime/data/excel-companion/plugin-policy.json"
       },
       "showPage": {
         "type": "boolean",
         "default": true,
-        "title": "显示 Excel 网关侧栏",
-        "description": "开启后，在 CPR 侧栏显示请求监控与网关设置。关闭只隐藏页面，不会关闭 Excel 通道。"
+        "title": "显示 Excel 网关侧栏"
       }
     },
-    "additionalProperties": false,
     "required": [
-      "isolationScope"
+      "policyFile"
     ],
-    "title": "连接与页面",
-    "description": "首次安装或更换桥接服务时配置。模型通道、并发排队与账户范围在侧栏「Excel 网关」中管理。"
+    "additionalProperties": false
   },
   "resources": {
     "web/index.html": "text/html",

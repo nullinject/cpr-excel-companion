@@ -1,6 +1,6 @@
 [package]
 name = "cpr-excel-companion-plugin"
-version = "0.9.0"
+version = "0.10.1"
 edition = "2024"
 license = "Unlicense"
 publish = false
@@ -10,5 +10,5 @@ gateway-plugin-sdk = { path = "../vendor/gateway-plugin-sdk", features = ["io"] 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt", "io-std", "net", "time"] }
-sha2 = "0.10"
-hex = "0.4"
+futures-util = "0.3"
+async-stream = "0.3"

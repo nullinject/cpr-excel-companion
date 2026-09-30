@@ -1,6 +1,4 @@
-//! 页面只使用官方宿主桥读取 Key/账户；桥接控制调用走进程内直连和逐请求签名。
-use crate::dial;
-use cpr_excel_companion::auth::{Context, sign};
+use cpr_excel_companion::control::Control;
 use gateway_plugin_sdk::{
     ErrorCode, PluginFault,
     call::{
@@ -13,47 +11,8 @@ use gateway_plugin_sdk::{
     client::{HostClient, SessionError, TypedCall, TypedReply},
 };
 use serde_json::json;
-use sha2::{Digest, Sha256};
-use std::time::{SystemTime, UNIX_EPOCH};
 fn fault(message: &str) -> PluginFault {
     PluginFault::new(ErrorCode::InvalidInput, message)
-}
-pub async fn remote(
-    _host: &HostClient,
-    url: &str,
-    secret: &[u8],
-    id: &str,
-    operation: &str,
-    payload: Vec<u8>,
-) -> Result<(u16, Vec<u8>), PluginFault> {
-    let mut hash = Sha256::new();
-    hash.update(operation.as_bytes());
-    hash.update(b"\n");
-    hash.update(&payload);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let context = Context {
-        account: "control".into(),
-        scope: hex::encode(hash.finalize()),
-        request_id: id.into(),
-        excel: false,
-        key: None,
-        expires: now + 30,
-    };
-    let token = sign(&context, secret).map_err(fault)?;
-    let reply = dial::post(
-        &format!("{}/{operation}", url.trim_end_matches('/')),
-        vec![
-            ("authorization".into(), format!("Bridge {token}")),
-            ("content-type".into(), "application/json".into()),
-        ],
-        payload,
-    )
-    .await
-    .map_err(|message| fault(&message))?;
-    Ok((reply.status, reply.body))
 }
 fn reply(status: u16, payload: Vec<u8>) -> TypedReply<ManagementResponse> {
     TypedReply::new(ManagementResponse {
@@ -65,8 +24,7 @@ fn reply(status: u16, payload: Vec<u8>) -> TypedReply<ManagementResponse> {
 }
 pub async fn handle(
     call: TypedCall<ManagementRequest>,
-    url: &str,
-    secret: &[u8],
+    control: &Control,
     plugin_info: &serde_json::Value,
 ) -> Result<TypedReply<ManagementResponse>, PluginFault> {
     if !call.request.query.is_empty() || call.payload.len() > 65536 {
@@ -125,26 +83,34 @@ pub async fn handle(
             serde_json::to_vec(&page).map_err(|_| fault("invalid catalog response"))?,
         ));
     }
-    let (operation, payload) = match (call.request.method.as_str(), call.request.path.as_str()) {
-        ("GET", "api/snapshot") if call.payload.is_empty() => ("snapshot", b"{}".to_vec()),
-        ("POST", "api/policy") => ("policy", call.payload),
-        ("POST", "api/observe") => ("observe", call.payload),
-        _ => return Ok(reply(404, br#"{"error":"not found"}"#.to_vec())),
-    };
-    let result = remote(
-        &call.host,
-        url,
-        secret,
-        &call.context.resource_scope_id,
-        operation,
-        payload,
-    )
-    .await;
-    Ok(match result {
-        Ok((status, payload)) => reply(status, payload),
-        Err(_) => json_error(502, "无法连接桥接服务，请检查服务状态与控制地址。"),
-    })
+    match (call.request.method.as_str(), call.request.path.as_str()) {
+        ("GET", "api/snapshot") if call.payload.is_empty() => Ok(reply(
+            200,
+            serde_json::to_vec(&control.snapshot())
+                .map_err(|_| fault("snapshot encoding failed"))?,
+        )),
+        ("POST", "api/policy") => {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Save {
+                policy: cpr_excel_companion::admission::Policy,
+                expected_version: Option<u64>,
+            }
+            let Ok(value) = serde_json::from_slice::<Save>(&call.payload) else {
+                return Ok(json_error(400, "invalid policy"));
+            };
+            Ok(match control.save(value.policy, value.expected_version) {
+                Ok(value) => reply(
+                    200,
+                    serde_json::to_vec(&value).map_err(|_| fault("policy encoding failed"))?,
+                ),
+                Err((status, error)) => json_error(status, error),
+            })
+        }
+        _ => Ok(json_error(404, "not found")),
+    }
 }
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CatalogRequest {
@@ -153,9 +119,11 @@ struct CatalogRequest {
 fn catalog_cursor(payload: &[u8]) -> Result<Option<String>, &'static str> {
     let request: CatalogRequest =
         serde_json::from_slice(payload).map_err(|_| "Invalid catalog request")?;
-    if request.cursor.as_ref().is_some_and(|cursor| {
-        cursor.is_empty() || cursor.len() > 4096
-    }) {
+    if request
+        .cursor
+        .as_ref()
+        .is_some_and(|cursor| cursor.is_empty() || cursor.len() > 4096)
+    {
         return Err("Invalid catalog cursor");
     }
     Ok(request.cursor)
@@ -182,8 +150,8 @@ async fn catalog_page(
             )
             .await
             .map_err(SessionError::into_plugin_fault)?;
-        let page: KeyListResult = serde_json::from_value(response.result)
-            .map_err(|_| fault("invalid key list"))?;
+        let page: KeyListResult =
+            serde_json::from_value(response.result).map_err(|_| fault("invalid key list"))?;
         Ok(json!({"items": page.keys, "next_cursor": page.next_cursor}))
     } else {
         let query = gateway_plugin_sdk::call::data::AccountFactsQuery {
@@ -200,8 +168,7 @@ async fn catalog_page(
             .await
             .map_err(SessionError::into_plugin_fault)?;
         let page: gateway_plugin_sdk::call::data::AccountFactsPage =
-            serde_json::from_slice(&response.payload)
-                .map_err(|_| fault("invalid account list"))?;
+            serde_json::from_slice(&response.payload).map_err(|_| fault("invalid account list"))?;
         Ok(json!({"items": page.accounts, "next_cursor": page.next_cursor}))
     }
 }
@@ -242,12 +209,6 @@ pub fn registration(show_page: bool) -> ManagementRegistration {
             ManagementRoute {
                 method: "POST".into(),
                 path: "api/policy".into(),
-                request_content_types: vec!["application/json".into()],
-                response_content_types: vec!["application/json".into()],
-            },
-            ManagementRoute {
-                method: "POST".into(),
-                path: "api/observe".into(),
                 request_content_types: vec!["application/json".into()],
                 response_content_types: vec!["application/json".into()],
             },
@@ -292,13 +253,19 @@ mod tests {
     fn catalog_routes_are_read_only_and_keep_existing_routes() {
         let registration = registration(true);
         for path in ["api/keys", "api/accounts"] {
-            assert!(registration.routes.iter().any(|route| {
-                route.path == path && route.method == "POST"
-            }));
+            assert!(
+                registration
+                    .routes
+                    .iter()
+                    .any(|route| { route.path == path && route.method == "POST" })
+            );
         }
-        assert!(registration.routes.iter().any(|route| {
-            route.path == "api/options" && route.method == "GET"
-        }));
+        assert!(
+            registration
+                .routes
+                .iter()
+                .any(|route| { route.path == "api/options" && route.method == "GET" })
+        );
         assert_eq!(registration.pages[0].id, "excel-gateway");
         assert!(super::registration(false).pages.is_empty());
     }

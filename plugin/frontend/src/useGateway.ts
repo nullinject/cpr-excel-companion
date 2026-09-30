@@ -60,7 +60,7 @@ export function useGateway() {
         || !Array.isArray(data.records)
         || !Number.isInteger(data.version)
       ) {
-        throw new Error('桥接返回的状态不完整。')
+        throw new Error('插件返回的状态不完整。')
       }
       if (snapshot.value && data.version < snapshot.value.version)
         return

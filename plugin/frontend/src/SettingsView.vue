@@ -154,7 +154,7 @@ const selectedCount = computed(
                     v-model="policyErrorsAsServerError"
                     type="checkbox"
                     role="switch"
-                  ><small>默认关闭。开启后，Excel 通道的 policy 错误转换为 server_error，由客户端或宿主现有机制决定重试，可能产生重复请求和额外计费。桥接不自行重试，原始错误仍记入服务器日志。</small>
+                  ><small>默认关闭。开启后，Excel 通道的 policy 错误转换为 server_error，由客户端或宿主现有机制决定重试，可能产生重复请求和额外计费。插件不自行重试。</small>
                 </div>
               </label>
               <label class="gw-field" for="gw-overflow">

@@ -43,6 +43,26 @@ pub async fn upload_inputs(
     headers: &HeaderMap,
     source: &mut Value,
 ) -> CodexClientResult<()> {
+    upload_with(source, |content_type, body| async move {
+        let mut upload_headers = headers.clone();
+        upload_headers.remove("accept");
+        upload_headers.insert("content-type", HeaderValue::from_str(&content_type)?);
+        let mut response = client.post(ATTACHMENTS_URL).headers(upload_headers).body(body)
+            .timeout(std::time::Duration::from_secs(120)).send().await?;
+        if !response.status().is_success() { return Err(CodexClientError::ExcelRequest("Excel attachment upload rejected")); }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if bytes.len() + chunk.len() > 65536 { return Err(CodexClientError::ExcelRequest("attachment response exceeds limit")); }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(bytes)
+    }).await
+}
+
+pub async fn upload_with<F, Fut>(source: &mut Value, mut upload: F) -> CodexClientResult<()>
+where F: FnMut(String, Vec<u8>) -> Fut,
+      Fut: std::future::Future<Output = CodexClientResult<Vec<u8>>>,
+{
     let Some(input) = source.get_mut("input").and_then(Value::as_array_mut) else {
         return Ok(());
     };
@@ -109,35 +129,7 @@ pub async fn upload_inputs(
             let mut body = format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\nContent-Type: {media_type}\r\n\r\n").into_bytes();
             body.extend_from_slice(&data);
             body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
-            let mut upload_headers = headers.clone();
-            upload_headers.remove("accept");
-            upload_headers.insert(
-                "content-type",
-                HeaderValue::from_str(&format!("multipart/form-data; boundary={boundary}"))?,
-            );
-            let response = client
-                .post(ATTACHMENTS_URL)
-                .headers(upload_headers)
-                .body(body)
-                .timeout(std::time::Duration::from_secs(120))
-                .send()
-                .await?;
-            if !response.status().is_success() {
-                return Err(CodexClientError::ExcelRequest(
-                    "Excel attachment upload rejected",
-                ));
-            }
-            // 上游元数据也有大小边界，避免把不受限响应累积到内存。
-            let mut response = response;
-            let mut bytes = Vec::new();
-            while let Some(chunk) = response.chunk().await? {
-                if bytes.len() + chunk.len() > 65536 {
-                    return Err(CodexClientError::ExcelRequest(
-                        "attachment response exceeds limit",
-                    ));
-                }
-                bytes.extend_from_slice(&chunk);
-            }
+            let bytes = upload(format!("multipart/form-data; boundary={boundary}"), body).await?;
             let uploaded: Value = serde_json::from_slice(&bytes).map_err(|_| {
                 CodexClientError::ExcelRequest("invalid attachment upload response")
             })?;

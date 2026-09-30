@@ -1,31 +1,21 @@
-//! 把宿主最终用量/失败观察转发给桥接，归并进请求记录（进程内直连控制通道）。
-//! 观察投递有界且不重投；转发失败只影响插件侧记录，不影响宿主结算。
-use crate::management::remote;
+use cpr_excel_companion::control::Control;
 use gateway_plugin_sdk::{
     ErrorCode, PluginFault,
     call::observation::{Event, RequestCompleted},
     client::{Empty, TypedCall, TypedReply},
 };
 
-pub async fn forward(
+pub async fn handle(
     call: TypedCall<Event>,
-    url: &str,
-    secret: &[u8],
+    control: &Control,
 ) -> Result<TypedReply<Empty>, PluginFault> {
     let Event::RequestCompleted(observation) = call.request else {
         return Ok(TypedReply::new(Empty {}));
     };
     let payload = project_completion(&observation)?;
-    // 观察回调不在请求路径上；转发失败只损失插件侧一条记录的终态合并。
-    let _ = remote(
-        &call.host,
-        url,
-        secret,
-        &observation.event_id,
-        "observe",
-        payload,
-    )
-    .await;
+    let observation = serde_json::from_slice(&payload)
+        .map_err(|_| PluginFault::new(ErrorCode::InvalidInput, "invalid observation"))?;
+    control.observe(&observation, crate::EXCEL_SUFFIX);
     Ok(TypedReply::new(Empty {}))
 }
 
