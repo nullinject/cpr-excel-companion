@@ -144,13 +144,22 @@ async fn upload(
     .await
     .map_err(|_| fault("attachment upload failed"))
 }
+fn decode_request(payload: &[u8]) -> Result<Value, PluginFault> {
+    let source: Value =
+        serde_json::from_slice(payload).map_err(|_| fault("invalid request JSON"))?;
+    if !source.is_object() {
+        return Err(fault("request must be an object"));
+    }
+    Ok(source)
+}
+
 pub async fn execute(
     call: TypedCall<UpstreamAdapterRequest>,
     control: Arc<Control>,
 ) -> Result<TypedReply<Empty>, PluginFault> {
     // Pull ownership ties cancellation/backpressure to the request, with no detached producer.
     let stream = async_stream::try_stream! {
-        let mut source: Value = serde_json::from_slice(&call.payload).map_err(|_| fault("invalid request JSON"))?;
+        let mut source = decode_request(&call.payload)?;
         let model = source["model"].as_str().unwrap_or(&call.request.upstream_model).to_owned();
         let context = Context { account: call.request.account_id.clone(), scope: call.request.client_key_id.clone(), request_id: call.context.request_id.clone().unwrap_or_else(|| call.context.resource_scope_id.clone()), excel: model.strip_suffix(crate::EXCEL_SUFFIX).is_some_and(|base| !base.is_empty()), key: None, expires: 0 };
         let lease = control.enter(&context, &model, crate::EXCEL_SUFFIX).await;
@@ -280,4 +289,26 @@ fn continuation(event: &Value, channel: &str, websocket: bool) -> Option<Upstrea
         upstream_response_id: event["response"]["id"].as_str()?.into(),
         state: json!({"channel":channel}).as_object()?.clone(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_request;
+    use gateway_plugin_sdk::ErrorCode;
+
+    #[test]
+    fn malformed_request_shapes_fail_before_policy_or_continuation_mutation() {
+        for bytes in [
+            b"[]".as_slice(),
+            b"null",
+            b"false",
+            b"42",
+            br#""text""#,
+            b"{",
+        ] {
+            let error = decode_request(bytes).unwrap_err();
+            assert_eq!(error.code, ErrorCode::InvalidInput);
+        }
+        assert!(decode_request(br#"{"input": "hello"}"#).is_ok());
+    }
 }

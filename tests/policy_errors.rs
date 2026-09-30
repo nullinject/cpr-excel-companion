@@ -1,7 +1,18 @@
-use cpr_excel_companion::{Tools, stream::{Translator, failure_details, failure_diagnostics}};
+use cpr_excel_companion::{
+    Tools,
+    stream::{Translator, failure_details, failure_diagnostics},
+};
 use serde_json::{Value, json};
 
-const CODES: [&str; 7] = ["cyber_policy", "bio_policy", "misalignment_policy_violation", "invalid_prompt", "server_overloaded", "content_filter", "usage_not_included"];
+const CODES: [&str; 7] = [
+    "cyber_policy",
+    "bio_policy",
+    "misalignment_policy_violation",
+    "invalid_prompt",
+    "server_overloaded",
+    "content_filter",
+    "usage_not_included",
+];
 
 #[test]
 fn native_error_codes_survive_every_supported_error_shape() {
@@ -17,7 +28,9 @@ fn native_error_codes_survive_every_supported_error_shape() {
         ] {
             assert_eq!(failure_details(&event).0, code, "{event}");
             let mut translator = Translator::new(Tools::new());
-            translator.event(json!({"type":"response.created","response":{"id":"resp_policy_test"}})).unwrap();
+            translator
+                .event(json!({"type":"response.created","response":{"id":"resp_policy_test"}}))
+                .unwrap();
             let result = translator.event(event).unwrap();
             assert_eq!(result.len(), 1);
             assert_eq!(result[0]["type"], "response.failed");
@@ -26,7 +39,12 @@ fn native_error_codes_survive_every_supported_error_shape() {
             assert_eq!(result[0]["response"]["error"]["code"], code);
             assert!(!result[0].to_string().contains("private-token"));
             assert!(translator.completed.is_none());
-            assert!(translator.event(json!({"type":"response.completed"})).unwrap().is_empty());
+            assert!(
+                translator
+                    .event(json!({"type":"response.completed"}))
+                    .unwrap()
+                    .is_empty()
+            );
         }
     }
 }
@@ -39,12 +57,18 @@ fn policy_failures_do_not_expose_partial_tools_or_private_messages() {
         "error":{"code":"cyber_policy","message":"private prompt Bearer private-token"},
         "output":[{"type":"function_call","name":"run_officejs","arguments":"{unfinished"}]}});
     let diagnostic = failure_diagnostics(&event);
-    assert_eq!(diagnostic["/response/error/code"]["recognized_code"], "cyber_policy");
+    assert_eq!(
+        diagnostic["/response/error/code"]["recognized_code"],
+        "cyber_policy"
+    );
     assert!(!diagnostic.to_string().contains("private"));
     let result = translator.event(event).unwrap();
     assert_eq!(result[0]["response"]["output"], json!([]));
     assert_eq!(result[0]["response"]["usage"]["input_tokens"], 19);
-    assert_eq!(result[0]["response"]["error"]["type"], "invalid_request_error");
+    assert_eq!(
+        result[0]["response"]["error"]["type"],
+        "invalid_request_error"
+    );
     assert!(translator.originals.is_empty());
     assert!(!result[0].to_string().contains("private"));
 }
@@ -63,5 +87,8 @@ fn unknown_errors_are_not_invented_as_policy_and_message_text_is_not_a_code() {
     let event: Value = json!({"type":"response.incomplete","response":{"incomplete_details":{"reason":"content_filter"}}});
     let result = Translator::new(Tools::new()).event(event).unwrap();
     assert_eq!(result[0]["type"], "response.incomplete");
-    assert_eq!(result[0]["response"]["incomplete_details"]["reason"], "content_filter");
+    assert_eq!(
+        result[0]["response"]["incomplete_details"]["reason"],
+        "content_filter"
+    );
 }

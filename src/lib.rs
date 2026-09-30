@@ -74,7 +74,10 @@ pub fn tool_catalog(source: &Value) -> Tools {
         // 后续声明覆盖同名工具。
         if let Some(items) = source["input"].as_array() {
             for item in items {
-                if item["type"].as_str().is_some_and(|k| k.eq_ignore_ascii_case("additional_tools")) {
+                if item["type"]
+                    .as_str()
+                    .is_some_and(|k| k.eq_ignore_ascii_case("additional_tools"))
+                {
                     add(&item["tools"], None, &mut out);
                 }
             }
@@ -113,6 +116,19 @@ fn relay_call(item: &Value) -> Result<Value> {
         }
         args.to_string()
     };
+    if item["type"] == "function_call"
+        && matches!(key.as_str(), "run_officejs" | "functions.run_officejs")
+    {
+        // A native transport item can survive in client history after a cache
+        // miss. Replaying its envelope as client arguments would nest it and
+        // select the transport itself instead of the referenced client tool.
+        // Keep the original JSON text and item identity for upstream replay.
+        let mut native = item.clone();
+        native["name"] = json!("run_officejs");
+        native["id"] = json!(function_id(item["id"].as_str(), call_id));
+        native.as_object_mut().unwrap().remove("namespace");
+        return Ok(native);
+    }
     Ok(
         json!({"type":"function_call", "id":function_id(item["id"].as_str(), call_id), "call_id":call_id,
         "name":"run_officejs", "status":"completed", "arguments":json!({
@@ -120,6 +136,35 @@ fn relay_call(item: &Value) -> Result<Value> {
             "code":payload,"destructive":false,"references":[key]
         }).to_string()}),
     )
+}
+
+/// Preserve supported values; an explicit unsupported value is never downgraded.
+fn reasoning_effort(source: &Value) -> Result<String> {
+    let reasoning = source.get("reasoning").filter(|value| !value.is_null());
+    if reasoning.is_some_and(|value| !value.is_object()) {
+        return Err("reasoning must be an object");
+    }
+    let value = reasoning
+        .and_then(|value| value.get("effort"))
+        .filter(|value| !value.is_null())
+        .or_else(|| {
+            source
+                .get("reasoning_effort")
+                .filter(|value| !value.is_null())
+        });
+    let Some(value) = value else {
+        return Ok("medium".to_owned());
+    };
+    let normalized = value
+        .as_str()
+        .ok_or("reasoning effort must be text")?
+        .trim()
+        .to_ascii_lowercase();
+    match normalized.as_str() {
+        "x-high" | "extra-high" | "extra_high" | "max" => Ok("xhigh".to_owned()),
+        "none" | "low" | "medium" | "high" | "xhigh" => Ok(normalized),
+        _ => Err("unsupported Excel reasoning effort; use none, low, medium, high or xhigh"),
+    }
 }
 
 /// original_calls 只能来自本账号此前的上游响应，不接受跨账号缓存。
@@ -152,16 +197,7 @@ pub fn prepare(source: &Value, original_calls: &BTreeMap<String, Value>) -> Resu
         .filter(|s| !s.is_empty())
         .ok_or("model is required")?;
     let model = model.strip_suffix("-excel").unwrap_or(model);
-    let effort = source
-        .pointer("/reasoning/effort")
-        .and_then(Value::as_str)
-        .or_else(|| source["reasoning_effort"].as_str())
-        .map(|value| match value.trim().to_lowercase().as_str() {
-            "x-high" | "extra-high" | "extra_high" | "max" => "xhigh".to_owned(),
-            other => other.to_owned(),
-        })
-        .filter(|value| ["low", "medium", "high", "xhigh"].contains(&value.as_str()))
-        .unwrap_or_else(|| "medium".to_owned());
+    let effort = reasoning_effort(source)?;
     let raw = match &source["input"] {
         Value::String(s) => {
             vec![json!({"type":"message","role":"user","content":[{"type":"input_text","text":s}]})]
@@ -213,6 +249,12 @@ pub fn prepare(source: &Value, original_calls: &BTreeMap<String, Value>) -> Resu
     for mut item in raw {
         let obj = item.as_object_mut().ok_or("input items must be objects")?;
         obj.remove("internal_chat_message_metadata_passthrough");
+        // This empty marker belongs to the client-facing plaintext call, not
+        // the BPS wire item. Non-empty upstream ciphertext must stay opaque;
+        // remembered native calls below are replayed without sanitizing them.
+        if obj.get("encrypted_function_args") == Some(&json!([])) {
+            obj.remove("encrypted_function_args");
+        }
         match item["type"].as_str().unwrap_or("message") {
             "function_call" | "custom_tool_call" => {
                 let id = item["call_id"].as_str().ok_or("tool call_id is required")?;
@@ -251,7 +293,11 @@ pub fn prepare(source: &Value, original_calls: &BTreeMap<String, Value>) -> Resu
     if tools.get("functions.exec").is_some_and(|tool| tool.custom) {
         // A compaction trigger is request control and must remain the final item.
         let reminder_index = input.len()
-            - usize::from(input.last().is_some_and(|item| item["type"] == "compaction_trigger"));
+            - usize::from(
+                input
+                    .last()
+                    .is_some_and(|item| item["type"] == "compaction_trigger"),
+            );
         input.insert(reminder_index, json!({"type":"message","role":"developer","content":[{"type":"input_text","text":
             "Tool routing reminder: APIs documented inside functions.exec (tools.* or mcp__* names) are NOT top-level client tools. Invoke them through outer run_officejs references=[\"functions.exec\"] with JavaScript code such as text(await tools.API_NAME({...}));. Outer references must use a top-level Catalog name. Do not repeat a tool call whose result is already in history."}]}));
     }
@@ -273,8 +319,11 @@ mod tool_envelope;
 // exact object-argument API declarations may be wrapped; this is not an alias
 // for arbitrary unknown tools, and the bridge never executes the generated JS.
 fn nested_exec_tool<'a>(name: &str, tools: &'a Tools) -> Option<&'a Tool> {
-    if name.is_empty() || name.len() > 160
-        || !name.bytes().enumerate().all(|(index, c)| c == b'_' || c.is_ascii_alphabetic() || (index > 0 && c.is_ascii_digit()))
+    if name.is_empty()
+        || name.len() > 160
+        || !name.bytes().enumerate().all(|(index, c)| {
+            c == b'_' || c.is_ascii_alphabetic() || (index > 0 && c.is_ascii_digit())
+        })
         || matches!(name, "constructor" | "prototype" | "__proto__")
     {
         return None;
@@ -296,7 +345,9 @@ fn function_payload(payload: &Value, direct: bool) -> Result<Value> {
             v => v.clone(),
         }
     };
-    if !inner.is_object() { return Err("function arguments must be an object"); }
+    if !inner.is_object() {
+        return Err("function arguments must be an object");
+    }
     Ok(inner)
 }
 
@@ -313,7 +364,9 @@ pub fn restore_call(native: &Value, tools: &Tools) -> Result<Value> {
             .ok_or("missing native arguments")?,
     )
     .map_err(|_| "invalid native arguments")?;
-    let references = args["references"].as_array().filter(|items| !items.is_empty());
+    let references = args["references"]
+        .as_array()
+        .filter(|items| !items.is_empty());
     let direct_payload = references.is_some();
     let (tool_key, payload) = if let Some(references) = references {
         if references.len() != 1 {
@@ -345,10 +398,18 @@ pub fn restore_call(native: &Value, tools: &Tools) -> Result<Value> {
         let inner = function_payload(&payload, direct_payload)?;
         // Serialize data as a JSON string, not a JavaScript object literal:
         // quotes/backticks/newlines stay data, and __proto__ stays an own key.
-        wrapped_input = Some(format!("text(await tools.{tool_key}(JSON.parse({})));", json!(inner.to_string())));
-        eprintln!("bridge nested tool routed {}", json!({"requested":tool_key,"wrapper":"functions.exec"}));
+        wrapped_input = Some(format!(
+            "text(await tools.{tool_key}(JSON.parse({})));",
+            json!(inner.to_string())
+        ));
+        eprintln!(
+            "bridge nested tool routed {}",
+            json!({"requested":tool_key,"wrapper":"functions.exec"})
+        );
         Some(exec)
-    } else { None };
+    } else {
+        None
+    };
     let tool = selected.ok_or_else(|| {
         // Names only: never log arguments, custom code, headers or credentials.
         eprintln!("bridge undeclared tool {}", json!({
@@ -362,7 +423,7 @@ pub fn restore_call(native: &Value, tools: &Tools) -> Result<Value> {
         .as_str()
         .filter(|s| !s.is_empty())
         .ok_or("missing native call_id")?;
-    let mut output = json!({"type":if tool.custom {"custom_tool_call"} else {"function_call"},"name":tool.name,"call_id":call_id,"status":"completed","id":function_id(native["id"].as_str(),call_id)});
+    let mut output = json!({"type":if tool.custom {"custom_tool_call"} else {"function_call"},"name":tool.name,"call_id":call_id,"status":"completed","id":function_id(native["id"].as_str(),call_id),"encrypted_function_args":[]});
     if let Some(ns) = &tool.namespace {
         output["namespace"] = json!(ns);
     }
@@ -403,12 +464,22 @@ mod tests {
         assert_eq!(restored["type"], "custom_tool_call");
         assert_eq!(restored["name"], "functions.exec");
         assert_eq!(restored["call_id"], "call_nested");
-        assert_eq!(restored["input"], format!("text(await tools.mcp__codex_app__list_threads(JSON.parse({})));", json!("{\"limit\":3}")));
+        assert_eq!(
+            restored["input"],
+            format!(
+                "text(await tools.mcp__codex_app__list_threads(JSON.parse({})));",
+                json!("{\"limit\":3}")
+            )
+        );
     }
     #[test]
     fn nested_api_fallback_keeps_unknown_tools_and_disabled_exec_rejected() {
         let mut source = exec_source();
-        for requested in ["mcp__codex_app__delete_everything", "mcp__codex_app__list_threads;evil()", "constructor"] {
+        for requested in [
+            "mcp__codex_app__delete_everything",
+            "mcp__codex_app__list_threads;evil()",
+            "constructor",
+        ] {
             let native = json!({"name":"run_officejs","call_id":"bad","arguments":json!({"references":[requested],"code":"{}"}).to_string()});
             assert!(restore_call(&native, &tool_catalog(&source)).is_err());
         }
@@ -423,7 +494,8 @@ mod tests {
         for code in ["[]", "null", "text(await tools.anything())"] {
             assert!(restore_call(&native(code), &tool_catalog(&source)).is_err());
         }
-        source["tools"][0]["description"] = json!("mcp__codex_app__list_threads is mentioned only in prose");
+        source["tools"][0]["description"] =
+            json!("mcp__codex_app__list_threads is mentioned only in prose");
         assert!(restore_call(&native("{}"), &tool_catalog(&source)).is_err());
         source = exec_source();
         source["tools"][0]["type"] = json!("function");
@@ -435,7 +507,11 @@ mod tests {
         let native = json!({"name":"run_officejs","call_id":"escaping","arguments":json!({"references":["mcp__codex_app__list_threads"],"code":payload.to_string()}).to_string()});
         let out = restore_call(&native, &tool_catalog(&exec_source())).unwrap();
         let code = out["input"].as_str().unwrap();
-        let quoted = code.strip_prefix("text(await tools.mcp__codex_app__list_threads(JSON.parse(").unwrap().strip_suffix(")));").unwrap();
+        let quoted = code
+            .strip_prefix("text(await tools.mcp__codex_app__list_threads(JSON.parse(")
+            .unwrap()
+            .strip_suffix(")));")
+            .unwrap();
         let serialized: String = serde_json::from_str(quoted).unwrap();
         assert_eq!(serde_json::from_str::<Value>(&serialized).unwrap(), payload);
     }
@@ -443,12 +519,16 @@ mod tests {
     fn top_level_tool_wins_and_namespaced_exec_retains_identity() {
         let mut source = exec_source();
         let native = json!({"name":"run_officejs","call_id":"identity","arguments":json!({"references":["mcp__codex_app__list_threads"],"code":"{}"}).to_string()});
-        source["tools"].as_array_mut().unwrap().push(json!({"type":"function","name":"mcp__codex_app__list_threads"}));
+        source["tools"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"function","name":"mcp__codex_app__list_threads"}));
         let out = restore_call(&native, &tool_catalog(&source)).unwrap();
         assert_eq!(out["type"], "function_call");
         assert_eq!(out["name"], "mcp__codex_app__list_threads");
         source = exec_source();
-        let mut exec = source["tools"][0].clone();exec["name"] = json!("exec");
+        let mut exec = source["tools"][0].clone();
+        exec["name"] = json!("exec");
         source["tools"] = json!([{"type":"namespace","name":"functions","tools":[exec]}]);
         let out = restore_call(&native, &tool_catalog(&source)).unwrap();
         assert_eq!(out["name"], "exec");
@@ -459,17 +539,33 @@ mod tests {
         let source = exec_source();
         let native = json!({"type":"function_call","name":"run_officejs","call_id":"nested_stream","arguments":json!({"references":["mcp__codex_app__list_threads"],"code":"{}"}).to_string()});
         let mut translator = stream::Translator::new(tool_catalog(&source));
-        let events = translator.event(json!({"type":"response.output_item.done","output_index":0,"item":native})).unwrap();
-        assert_eq!(events.iter().filter(|e| e["type"] == "response.output_item.done").count(), 1);
+        let events = translator
+            .event(json!({"type":"response.output_item.done","output_index":0,"item":native}))
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e["type"] == "response.output_item.done")
+                .count(),
+            1
+        );
         let terminal = translator.event(json!({"type":"response.completed","response":{"id":"resp_nested","output":[native]}})).unwrap();
         assert_eq!(terminal.len(), 1);
-        assert_eq!(terminal[0]["response"]["output"][0]["type"], "custom_tool_call");
+        assert_eq!(
+            terminal[0]["response"]["output"][0]["type"],
+            "custom_tool_call"
+        );
         assert_eq!(translator.originals["nested_stream"], native);
         let mut next = source.clone();
         next["input"] = json!([terminal[0]["response"]["output"][0],{"type":"custom_tool_call_output","call_id":"nested_stream","output":"listed"}]);
         let upstream = prepare(&next, &translator.originals).unwrap();
         assert!(upstream["input"].as_array().unwrap().contains(&native));
-        assert!(upstream["input"].as_array().unwrap().last().unwrap()["content"][0]["text"].as_str().unwrap().contains("NOT top-level"));
+        assert!(
+            upstream["input"].as_array().unwrap().last().unwrap()["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("NOT top-level")
+        );
     }
     fn source() -> Value {
         json!({"model":"gpt-5.6-sol-excel","input":"hello","tools":[{"type":"function","name":"shell","parameters":{"type":"object"}}]})
@@ -486,8 +582,7 @@ mod tests {
         let prepared = prepare(&s, &BTreeMap::new()).unwrap();
         assert_eq!(prepared["reasoning_effort"], "xhigh");
         s["reasoning"] = json!({"effort":"ultra"});
-        let prepared = prepare(&s, &BTreeMap::new()).unwrap();
-        assert_eq!(prepared["reasoning_effort"], "medium");
+        assert!(prepare(&s, &BTreeMap::new()).is_err());
     }
     #[test]
     fn tool_result_ids_preserve_valid_and_fix_invalid() {
@@ -543,12 +638,20 @@ mod tests {
             "arguments":json!({"references":[],"code":json!({"name":"shell","arguments":{"cmd":"echo legacy"}}).to_string()}).to_string()});
         let restored = restore_call(&native, &tools).unwrap();
         assert_eq!(restored["name"], "shell");
-        assert_eq!(restored["arguments"], json!({"cmd":"echo legacy"}).to_string());
+        assert_eq!(
+            restored["arguments"],
+            json!({"cmd":"echo legacy"}).to_string()
+        );
     }
     #[test]
     fn references_do_not_bypass_declared_tool_validation() {
         let tools = tool_catalog(&source());
-        for references in [json!([]), json!(["missing"]), json!(["shell","shell"]), json!(["run_officejs"])] {
+        for references in [
+            json!([]),
+            json!(["missing"]),
+            json!(["shell", "shell"]),
+            json!(["run_officejs"]),
+        ] {
             let native = json!({"type":"function_call","call_id":"call_bad","name":"run_officejs",
                 "arguments":json!({"references":references,"code":"{}"}).to_string()});
             assert!(restore_call(&native, &tools).is_err());

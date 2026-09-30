@@ -47,21 +47,36 @@ pub async fn upload_inputs(
         let mut upload_headers = headers.clone();
         upload_headers.remove("accept");
         upload_headers.insert("content-type", HeaderValue::from_str(&content_type)?);
-        let mut response = client.post(ATTACHMENTS_URL).headers(upload_headers).body(body)
-            .timeout(std::time::Duration::from_secs(120)).send().await?;
-        if !response.status().is_success() { return Err(CodexClientError::ExcelRequest("Excel attachment upload rejected")); }
+        let mut response = client
+            .post(ATTACHMENTS_URL)
+            .headers(upload_headers)
+            .body(body)
+            .timeout(std::time::Duration::from_secs(120))
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(CodexClientError::ExcelRequest(
+                "Excel attachment upload rejected",
+            ));
+        }
         let mut bytes = Vec::new();
         while let Some(chunk) = response.chunk().await? {
-            if bytes.len() + chunk.len() > 65536 { return Err(CodexClientError::ExcelRequest("attachment response exceeds limit")); }
+            if bytes.len() + chunk.len() > 65536 {
+                return Err(CodexClientError::ExcelRequest(
+                    "attachment response exceeds limit",
+                ));
+            }
             bytes.extend_from_slice(&chunk);
         }
         Ok(bytes)
-    }).await
+    })
+    .await
 }
 
 pub async fn upload_with<F, Fut>(source: &mut Value, mut upload: F) -> CodexClientResult<()>
-where F: FnMut(String, Vec<u8>) -> Fut,
-      Fut: std::future::Future<Output = CodexClientResult<Vec<u8>>>,
+where
+    F: FnMut(String, Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = CodexClientResult<Vec<u8>>>,
 {
     let Some(input) = source.get_mut("input").and_then(Value::as_array_mut) else {
         return Ok(());

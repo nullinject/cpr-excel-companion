@@ -48,17 +48,18 @@ fn record_terminal(record: &mut Record, event: &Value) {
         Some("response.completed") => "completed",
         Some("response.incomplete") => "incomplete",
         _ => "failed",
-    }.into();
+    }
+    .into();
     record.usage = event["response"].get("usage").cloned();
     record.finished_at_ms = Some(now());
     if record.status == "incomplete" {
-        let reason=crate::stream::incomplete_reason(event);
-        record.error_code=Some(reason.into());
-        record.error=Some(format!("Excel upstream response incomplete: {reason}"));
+        let reason = crate::stream::incomplete_reason(event);
+        record.error_code = Some(reason.into());
+        record.error = Some(format!("Excel upstream response incomplete: {reason}"));
     } else if record.status == "failed" {
-        let (code,_,message)=crate::stream::failure_details(event);
-        record.error_code=Some(code.into());
-        record.error=Some(message.into());
+        let (code, _, message) = crate::stream::failure_details(event);
+        record.error_code = Some(code.into());
+        record.error = Some(message.into());
     }
 }
 #[derive(Serialize, Deserialize)]
@@ -162,8 +163,8 @@ impl Control {
     }
     /// 签名请求的通道解析与准入：
     ///
-    /// 1. model_channels 按基础模型名覆盖（Excel=无后缀强制走 Excel；Native=带后缀压回原生）；
-    /// 2. 缺省跟随后缀语义（ctx.excel）；
+    /// 1. 已认证 Key × 基础模型覆盖全局模型规则，缺省跟随后缀语义；
+    /// 2. 通道规则只影响路由，不授予宿主模型或账户权限；
     /// 3. accounts/models 粗粒度范围只约束 Excel 通道，原生透传不受并发预算约束。
     /// 4. 每个签名请求都留记录（含走原生的），侧边栏才能反映全量走向。
     pub async fn enter(self: &Arc<Self>, ctx: &Context, model: &str, suffix: &str) -> Lease {
@@ -173,12 +174,13 @@ impl Control {
             .unwrap_or(model);
         let (excel, gate, guard) = {
             let mut i = self.lock();
-            let channel = i.saved.policy.model_channels.get(base).copied();
-            let desired = match channel {
-                Some(crate::admission::Channel::Excel) => true,
-                Some(crate::admission::Channel::Native) => false,
-                None => ctx.excel,
+            let requested = if ctx.excel {
+                crate::admission::Channel::Excel
+            } else {
+                crate::admission::Channel::Native
             };
+            let desired = i.saved.policy.channel_for(base, &ctx.scope, requested)
+                == crate::admission::Channel::Excel;
             let permitted = i.saved.policy.enabled
                 && i.saved.policy.models.permits(model)
                 && i.saved.policy.accounts.permits(&ctx.account);
@@ -329,7 +331,9 @@ impl Control {
                 if failure.error_code.is_some() {
                     row.error_code = failure.error_code.clone();
                 }
-                if let Some(status) = failure.upstream_status_code && row.error.is_none() {
+                if let Some(status) = failure.upstream_status_code
+                    && row.error.is_none()
+                {
                     row.error = Some(format!("upstream status {status}"));
                 }
             }
@@ -365,10 +369,10 @@ impl Control {
                 .usage
                 .as_ref()
                 .and_then(|u| serde_json::to_value(u).ok()),
-            error: observation
-                .failure
-                .as_ref()
-                .and_then(|f| f.upstream_status_code.map(|s| format!("upstream status {s}"))),
+            error: observation.failure.as_ref().and_then(|f| {
+                f.upstream_status_code
+                    .map(|s| format!("upstream status {s}"))
+            }),
             upstream_model: observation.upstream_model.clone(),
             excel: true,
             key_hash: None,
@@ -459,32 +463,60 @@ mod tests {
     use super::*;
     #[tokio::test]
     async fn terminal_monitor_records_sanitized_failure_and_incomplete_reason() {
-        let path=std::env::temp_dir().join(format!("excel-terminal-{}",uuid::Uuid::new_v4()));
-        let c=Arc::new(Control::load(path).unwrap());
-        let ctx=Context { account:"a".into(),scope:"k".into(),request_id:"failed-test".into(),excel:false,key:None,expires:1 };
-        let lease=c.enter(&ctx,"test","-excel").await;
+        let path = std::env::temp_dir().join(format!("excel-terminal-{}", uuid::Uuid::new_v4()));
+        let c = Arc::new(Control::load(path).unwrap());
+        let ctx = Context {
+            account: "a".into(),
+            scope: "k".into(),
+            request_id: "failed-test".into(),
+            excel: false,
+            key: None,
+            expires: 1,
+        };
+        let lease = c.enter(&ctx, "test", "-excel").await;
         lease.terminal(&json!({"type":"response.failed","response":{"status":"failed","usage":{"input_tokens":7},"error":{"code":"rate_limit_exceeded","message":"private prompt secret"}}}));
-        let snapshot=c.snapshot();let record=&snapshot["records"][0];
-        assert_eq!(record["error_code"],"rate_limit_exceeded");
+        let snapshot = c.snapshot();
+        let record = &snapshot["records"][0];
+        assert_eq!(record["error_code"], "rate_limit_exceeded");
         assert!(!record.to_string().contains("private prompt"));
-        assert_eq!(record["usage"]["input_tokens"],7);
-        let unsigned=c.enter_unsigned("incomplete-test","test",Some("a")).unwrap();
+        assert_eq!(record["usage"]["input_tokens"], 7);
+        let unsigned = c
+            .enter_unsigned("incomplete-test", "test", Some("a"))
+            .unwrap();
         c.finish_unsigned("incomplete-test",&json!({"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}));
         drop(unsigned);
-        let snapshot=c.snapshot();let record=&snapshot["records"][0];
-        assert_eq!(record["status"],"incomplete");
-        assert_eq!(record["error_code"],"max_output_tokens");
-        let observation=crate::observe::ObserveEvent {
-            event_id:"observation".into(),request_id:"failed-test".into(),client_key_id:None,
-            account_id:None,upstream_model:None,requested_model:None,completed_at_ms:1,
-            terminal:Some(crate::observe::Terminal { outcome:crate::observe::Outcome::Failed,error_code:None }),
-            failure:Some(crate::observe::Failure { error_code:None,upstream_status_code:Some(429),client_status_code:Some(429) }),usage:None,
+        let snapshot = c.snapshot();
+        let record = &snapshot["records"][0];
+        assert_eq!(record["status"], "incomplete");
+        assert_eq!(record["error_code"], "max_output_tokens");
+        let observation = crate::observe::ObserveEvent {
+            event_id: "observation".into(),
+            request_id: "failed-test".into(),
+            client_key_id: None,
+            account_id: None,
+            upstream_model: None,
+            requested_model: None,
+            completed_at_ms: 1,
+            terminal: Some(crate::observe::Terminal {
+                outcome: crate::observe::Outcome::Failed,
+                error_code: None,
+            }),
+            failure: Some(crate::observe::Failure {
+                error_code: None,
+                upstream_status_code: Some(429),
+                client_status_code: Some(429),
+            }),
+            usage: None,
         };
-        c.observe(&observation,"-excel");
-        let snapshot=c.snapshot();let records=snapshot["records"].as_array().unwrap();
-        let record=records.iter().find(|r|r["request_id"]=="failed-test").unwrap();
-        assert_eq!(record["error_code"],"rate_limit_exceeded");
-        assert_eq!(record["error"],"Excel upstream rate limit exceeded");
+        c.observe(&observation, "-excel");
+        let snapshot = c.snapshot();
+        let records = snapshot["records"].as_array().unwrap();
+        let record = records
+            .iter()
+            .find(|r| r["request_id"] == "failed-test")
+            .unwrap();
+        assert_eq!(record["error_code"], "rate_limit_exceeded");
+        assert_eq!(record["error"], "Excel upstream rate limit exceeded");
     }
     #[tokio::test]
     async fn policy_changes_wait_for_leases_and_cancelled_waiters_release_state() {

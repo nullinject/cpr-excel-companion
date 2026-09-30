@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { Activity, RefreshCw } from '@lucide/vue'
 import { computed, ref } from 'vue'
+import { routingModels } from './gateway'
 import MonitorView from './MonitorView.vue'
 import SettingsView from './SettingsView.vue'
 import { useGateway } from './useGateway'
@@ -46,25 +47,8 @@ const updatedLabel = computed(() =>
     ? new Date(lastUpdated.value).toLocaleTimeString('zh-CN', { hour12: false })
     : '尚未同步',
 )
-const models = computed(() => {
-  const suffix = info.value?.excelModelSuffix ?? '-excel'
-  const names = new Set([
-    'gpt-5.6-sol',
-    'gpt-5.6-terra',
-    'gpt-5.6-luna',
-    'gpt-6-astra',
-    ...Object.keys(draft.value?.model_channels ?? {}),
-  ])
-  for (const row of snapshot.value?.records ?? []) {
-    const name
-      = suffix && row.model.endsWith(suffix)
-        ? row.model.slice(0, -suffix.length)
-        : row.model
-    if (name)
-      names.add(name)
-  }
-  return [...names].sort()
-})
+const models = computed(() => routingModels(draft.value, snapshot.value?.records ?? [], info.value?.excelModelSuffix ?? '-excel'))
+
 async function reload() {
   await Promise.all([refresh(), loadCatalogs(), loadInfo()])
 }

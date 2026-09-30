@@ -102,7 +102,10 @@ mod tests {
         assert_eq!(event.usage.as_ref().unwrap().input_tokens, Some(22357));
         assert_eq!(event.terminal.as_ref().unwrap().outcome, Outcome::Succeeded);
         let projected = serde_json::to_value(&event).unwrap();
-        assert_eq!(projected["usage"]["timings"], serde_json::json!({"first_token_ms":1200,"latency_ms":2600}));
+        assert_eq!(
+            projected["usage"]["timings"],
+            serde_json::json!({"first_token_ms":1200,"latency_ms":2600})
+        );
         let empty: Usage = serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(empty.timings.is_none());
     }

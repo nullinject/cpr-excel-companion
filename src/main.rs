@@ -21,8 +21,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-mod request_body;
 mod native;
+mod request_body;
 
 type Events = Pin<Box<dyn Stream<Item = Result<Value, &'static str>> + Send>>;
 type Failure = (StatusCode, axum::Json<Value>);
@@ -51,7 +51,10 @@ struct App {
     clients: Mutex<BTreeMap<String, (Account, reqwest::Client)>>,
 }
 fn fail(status: StatusCode, message: &'static str) -> Failure {
-    if matches!(message, excel::history::MISSING | excel::history::CACHE_LIMIT) {
+    if matches!(
+        message,
+        excel::history::MISSING | excel::history::CACHE_LIMIT
+    ) {
         return (
             StatusCode::BAD_REQUEST,
             axum::Json(json!({"error":{
@@ -72,9 +75,13 @@ mod continuation_error_tests {
     use super::*;
     #[test]
     fn cache_limit_requests_replay_without_losing_input() {
-        excel::history::save("limit-test-scope", &[json!({"role":"user","content":"prior"})],
-            &json!({"id":"resp_limit_test","status":"completed","output":[]}));
-        let mut source = json!({"previous_response_id":"resp_limit_test","input":"x".repeat(2 * 1024 * 1024)});
+        excel::history::save(
+            "limit-test-scope",
+            &[json!({"role":"user","content":"prior"})],
+            &json!({"id":"resp_limit_test","status":"completed","output":[]}),
+        );
+        let mut source =
+            json!({"previous_response_id":"resp_limit_test","input":"x".repeat(2 * 1024 * 1024)});
         let original = source.clone();
         let message = excel::history::restore("limit-test-scope", &mut source).unwrap_err();
         assert_eq!(message, excel::history::CACHE_LIMIT);
@@ -82,7 +89,10 @@ mod continuation_error_tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["code"], "previous_response_not_found");
         assert_eq!(source, original);
-        source.as_object_mut().unwrap().remove("previous_response_id");
+        source
+            .as_object_mut()
+            .unwrap()
+            .remove("previous_response_id");
         excel::history::restore("limit-test-scope", &mut source).unwrap();
     }
     #[test]
@@ -104,7 +114,10 @@ enum Identity {
     Unsigned,
 }
 fn context(headers: &HeaderMap, app: &App) -> Result<Identity, Failure> {
-    let Some(raw) = headers.get("x-excel-bridge-context").and_then(|v| v.to_str().ok()) else {
+    let Some(raw) = headers
+        .get("x-excel-bridge-context")
+        .and_then(|v| v.to_str().ok())
+    else {
         // 绑定未命中的 key（宿主不调用插件）走这里：只允许原生透传。
         if app.allow_unsigned {
             return Ok(Identity::Unsigned);
@@ -139,23 +152,36 @@ fn unsigned_client(app: &App, account_id: Option<&str>) -> Result<reqwest::Clien
     let route = unsigned_route(&config, Some(id))?;
     cached_client(app, id, route)
 }
-fn unsigned_route<'a>(config: &'a Config, account_id: Option<&str>) -> Result<&'a Account, Failure> {
+fn unsigned_route<'a>(
+    config: &'a Config,
+    account_id: Option<&str>,
+) -> Result<&'a Account, Failure> {
     let id = account_id.filter(|id| !id.is_empty()).ok_or_else(|| {
-        fail(StatusCode::SERVICE_UNAVAILABLE, "upstream account identity required")
+        fail(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "upstream account identity required",
+        )
     })?;
     if let Some(route) = config.accounts.get(id) {
         return Ok(route);
     }
     // CPR's account id and ChatGPT's account id are different namespaces.
     // Resolve the latter explicitly; never guess another account's egress.
-    let mut matches = config.accounts.values().filter(|route| {
-        route.upstream_account_id.as_deref() == Some(id)
-    });
+    let mut matches = config
+        .accounts
+        .values()
+        .filter(|route| route.upstream_account_id.as_deref() == Some(id));
     let route = matches.next().ok_or_else(|| {
-        fail(StatusCode::SERVICE_UNAVAILABLE, "upstream account is not mapped")
+        fail(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "upstream account is not mapped",
+        )
     })?;
     if matches.next().is_some() {
-        return Err(fail(StatusCode::SERVICE_UNAVAILABLE, "upstream account route is ambiguous"));
+        return Err(fail(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "upstream account route is ambiguous",
+        ));
     }
     Ok(route)
 }
@@ -192,16 +218,29 @@ fn cached_client(app: &App, id: &str, route: &Account) -> Result<reqwest::Client
 }
 // Full upstream errors stay in a private, rotating server log, not client responses.
 fn upstream_error_log(app: &App) -> excel::error_log::ErrorLog {
-    let parent = std::path::Path::new(&app.config_path).parent().unwrap_or_else(|| std::path::Path::new("."));
+    let parent = std::path::Path::new(&app.config_path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
     excel::error_log::ErrorLog::new(parent.join("error-logs/upstream-errors.jsonl"))
 }
 fn error_log_secrets(app: &App, headers: &HeaderMap, context_token: &str) -> Vec<String> {
-    let mut values = vec![context_token.to_owned(), String::from_utf8_lossy(&app.secret).into_owned()];
-    for name in ["authorization", "proxy-authorization", "cookie", "x-api-key", "x-excel-bridge-context"] {
+    let mut values = vec![
+        context_token.to_owned(),
+        String::from_utf8_lossy(&app.secret).into_owned(),
+    ];
+    for name in [
+        "authorization",
+        "proxy-authorization",
+        "cookie",
+        "x-api-key",
+        "x-excel-bridge-context",
+    ] {
         if let Some(value) = headers.get(name).and_then(|v| v.to_str().ok()) {
             values.push(value.to_owned());
-            if let Some((scheme, token)) = value.split_once(' ') {
-                if scheme.eq_ignore_ascii_case("bearer") || scheme.eq_ignore_ascii_case("basic") { values.push(token.to_owned()); }
+            if let Some((scheme, token)) = value.split_once(' ')
+                && (scheme.eq_ignore_ascii_case("bearer") || scheme.eq_ignore_ascii_case("basic"))
+            {
+                values.push(token.to_owned());
             }
         }
     }
@@ -556,8 +595,8 @@ async fn open_events_at(
         original_input = vec![];
         if let Some(object) = source.as_object_mut() {
             // 通道覆盖为原生时收到的可能带后缀；上游不认识，统一还原。
-            if let Some(Value::String(m)) = object.get("model") && let Some(base) =
-                m.strip_suffix(&app.suffix).filter(|b| !b.is_empty())
+            if let Some(Value::String(m)) = object.get("model")
+                && let Some(base) = m.strip_suffix(&app.suffix).filter(|b| !b.is_empty())
             {
                 object.insert("model".into(), json!(base));
             }
@@ -565,8 +604,22 @@ async fn open_events_at(
         }
         if let Some(session) = native {
             let config = read_config(&app)?;
-            let route = config.accounts.get(&ctx.account).ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "account is not configured for this bridge"))?.clone();
-            let mut upstream = session.events(client, headers, route, source).await.map_err(|error| { lease.fail("native WebSocket open failed"); error })?;
+            let route = config
+                .accounts
+                .get(&ctx.account)
+                .ok_or_else(|| {
+                    fail(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "account is not configured for this bridge",
+                    )
+                })?
+                .clone();
+            let mut upstream = session
+                .events(client, headers, route, source)
+                .await
+                .inspect_err(|_| {
+                    lease.fail("native WebSocket open failed");
+                })?;
             return Ok(Box::pin(async_stream::stream! {
                 while let Some(event) = upstream.next().await {
                     match &event {
@@ -607,18 +660,33 @@ async fn open_events_at(
         // 上游拒绝原因对排障关键；截断后随错误体返回给宿主重试链路。
         let detail = response.text().await.unwrap_or_default();
         let secrets: Vec<&str> = error_secrets.iter().map(String::as_str).collect();
-        if let Err(error) = upstream_error_log(&app).record_http(&ctx.request_id, status.as_u16(), &detail, &secrets) {
-            eprintln!("bridge error_record_failed {} kind={:?}", ctx.request_id, error.kind());
+        if let Err(error) = upstream_error_log(&app).record_http(
+            &ctx.request_id,
+            status.as_u16(),
+            &detail,
+            &secrets,
+        ) {
+            eprintln!(
+                "bridge error_record_failed {} kind={:?}",
+                ctx.request_id,
+                error.kind()
+            );
         }
         // Preserve the bounded client response while excluding credentials.
         let parsed = serde_json::from_str::<Value>(&detail).unwrap_or_else(|_| json!(detail));
         if map_policy_errors && let Some(mut error) = excel::stream::policy_server_error(&parsed) {
             error["request_id"] = json!(ctx.request_id);
             note("Excel upstream server error".into());
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"error":error}))));
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"error":error})),
+            ));
         }
         let clean = excel::error_log::sanitize(&parsed, &secrets);
-        let detail = clean.as_str().map(str::to_owned).unwrap_or_else(|| clean.to_string());
+        let detail = clean
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| clean.to_string());
         eprintln!("bridge request {} upstream status {status}", ctx.request_id);
         let mut message = format!("upstream status {status}");
         let detail = detail.trim();
@@ -691,11 +759,11 @@ async fn open_events_at(
                         if event.get("status").is_some() { event["status"] = json!(500); }
                     }
                     // A client can quote this ID without exposing any upstream error text.
-                    if ctx.excel && event["type"] == "response.failed" {
-                        if let Some(message) = event.pointer("/response/error/message").and_then(Value::as_str) {
-                            event["response"]["error"]["message"] = json!(format!("{message} [request_id={}]", ctx.request_id));
-                            event["response"]["error"]["request_id"] = json!(ctx.request_id);
-                        }
+                    if ctx.excel && event["type"] == "response.failed"
+                        && let Some(message) = event.pointer("/response/error/message").and_then(Value::as_str)
+                    {
+                        event["response"]["error"]["message"] = json!(format!("{message} [request_id={}]", ctx.request_id));
+                        event["response"]["error"]["request_id"] = json!(ctx.request_id);
                     }
                     terminal = excel::stream::is_terminal(&event);
                     if terminal { lease.terminal(&event); eprintln!("bridge timing {} terminal_ms={} event={}", ctx.request_id, started.elapsed().as_millis(), event["type"]); }
@@ -760,7 +828,12 @@ async fn unsigned_events(
     if let Some(session) = native {
         let config = read_config(&app)?;
         let route = unsigned_route(&config, account_id.as_deref())?.clone();
-        let mut events = session.events(client, upstream, route, source).await.map_err(|error| { lease.fail("native WebSocket open failed"); error })?;
+        let mut events = session
+            .events(client, upstream, route, source)
+            .await
+            .inspect_err(|_| {
+                lease.fail("native WebSocket open failed");
+            })?;
         app.control.running(&request_id, 0);
         return Ok(Box::pin(async_stream::stream! {
             while let Some(event) = events.next().await {
@@ -791,7 +864,10 @@ async fn unsigned_events(
         let status = response.status();
         let detail = response.text().await.unwrap_or_default();
         let trimmed = detail.trim();
-        let cut = trimmed.char_indices().nth(512).map_or(trimmed.len(), |(i, _)| i);
+        let cut = trimmed
+            .char_indices()
+            .nth(512)
+            .map_or(trimmed.len(), |(i, _)| i);
         lease.fail(&format!("upstream status {status}: {}", &trimmed[..cut]));
         return Err((
             status,
@@ -838,18 +914,34 @@ async fn models(
     let identity = context(&headers, &app)?;
     let client = match identity {
         Identity::Signed(ctx) => client(&app, &ctx)?,
-        Identity::Unsigned => unsigned_client(&app, headers.get("chatgpt-account-id").and_then(|value| value.to_str().ok()))?,
+        Identity::Unsigned => unsigned_client(
+            &app,
+            headers
+                .get("chatgpt-account-id")
+                .and_then(|value| value.to_str().ok()),
+        )?,
     };
     let mut upstream = upstream_headers(&headers, false)?;
     upstream.insert("accept", "application/json".parse().unwrap());
     let mut url = reqwest::Url::parse("https://chatgpt.com/backend-api/codex/models").unwrap();
     url.set_query(query.as_deref());
-    let response = client.get(url).headers(upstream).send().await
-        .map_err(|_| fail(StatusCode::BAD_GATEWAY, "native model directory connection failed"))?;
+    let response = client
+        .get(url)
+        .headers(upstream)
+        .send()
+        .await
+        .map_err(|_| {
+            fail(
+                StatusCode::BAD_GATEWAY,
+                "native model directory connection failed",
+            )
+        })?;
     let status = response.status();
     let mut output = HeaderMap::new();
     for name in ["content-type", "etag", "cache-control"] {
-        if let Some(value) = response.headers().get(name) { output.insert(name, value.clone()); }
+        if let Some(value) = response.headers().get(name) {
+            output.insert(name, value.clone());
+        }
     }
     Ok((status, output, Body::from_stream(response.bytes_stream())).into_response())
 }
@@ -1084,24 +1176,26 @@ mod terminal_error_tests {
     #[tokio::test]
     async fn terminal_wrapper_ignores_errors_after_success() {
         let source: Events = Box::pin(futures_util::stream::iter(vec![
-            Ok(json!({"type":"response.completed","sequence_number":8,"response":{"id":"resp_done","status":"completed","output":[]}})),
+            Ok(
+                json!({"type":"response.completed","sequence_number":8,"response":{"id":"resp_done","status":"completed","output":[]}}),
+            ),
             Err("trailing transport failure"),
         ]));
-        let output=terminal_errors(source).collect::<Vec<_>>().await;
-        assert_eq!(output.len(),1);
-        assert_eq!(output[0].as_ref().unwrap()["type"],"response.completed");
+        let output = terminal_errors(source).collect::<Vec<_>>().await;
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].as_ref().unwrap()["type"], "response.completed");
     }
     #[tokio::test]
     async fn terminal_wrapper_marks_eof_and_retains_identity_and_sequence() {
-        let source: Events = Box::pin(futures_util::stream::iter(vec![
-            Ok(json!({"type":"response.created","sequence_number":6,"response":{"id":"resp_open","status":"in_progress"}}))
-        ]));
-        let output=terminal_errors(source).collect::<Vec<_>>().await;
-        assert_eq!(output.len(),2);
-        let terminal=output[1].as_ref().unwrap();
-        assert_eq!(terminal["type"],"response.failed");
-        assert_eq!(terminal["response"]["id"],"resp_open");
-        assert_eq!(terminal["sequence_number"],7);
+        let source: Events = Box::pin(futures_util::stream::iter(vec![Ok(
+            json!({"type":"response.created","sequence_number":6,"response":{"id":"resp_open","status":"in_progress"}}),
+        )]));
+        let output = terminal_errors(source).collect::<Vec<_>>().await;
+        assert_eq!(output.len(), 2);
+        let terminal = output[1].as_ref().unwrap();
+        assert_eq!(terminal["type"], "response.failed");
+        assert_eq!(terminal["response"]["id"], "resp_open");
+        assert_eq!(terminal["sequence_number"], 7);
     }
     #[tokio::test]
     async fn pooled_client_reuses_connection_and_does_not_bypass_changed_routes() {
@@ -1202,7 +1296,10 @@ mod terminal_error_tests {
         assert_eq!(terminal["type"], "response.failed");
         assert_eq!(terminal["sequence_number"], 4);
         assert_eq!(terminal["response"]["id"], "resp_test");
-        assert_eq!(terminal["response"]["error"]["message"], "invalid tool transport envelope");
+        assert_eq!(
+            terminal["response"]["error"]["message"],
+            "invalid tool transport envelope"
+        );
     }
 }
 
@@ -1216,12 +1313,22 @@ mod account_route_tests {
             "acct_first":{"direct":true,"upstream_account_id":"upstream_first"},
             "acct_second":{"direct":false,"proxy":"socks5h://127.0.0.1:1080","upstream_account_id":"upstream_second"}
         }})).unwrap();
-        assert_eq!(unsigned_route(&config, Some("upstream_second")).unwrap().proxy.as_deref(), Some("socks5h://127.0.0.1:1080"));
+        assert_eq!(
+            unsigned_route(&config, Some("upstream_second"))
+                .unwrap()
+                .proxy
+                .as_deref(),
+            Some("socks5h://127.0.0.1:1080")
+        );
         assert!(unsigned_route(&config, Some("unknown")).is_err());
         assert!(unsigned_route(&config, Some("")).is_err());
         assert!(unsigned_route(&config, None).is_err());
         let mut ambiguous = config;
-        ambiguous.accounts.get_mut("acct_first").unwrap().upstream_account_id = Some("upstream_second".into());
+        ambiguous
+            .accounts
+            .get_mut("acct_first")
+            .unwrap()
+            .upstream_account_id = Some("upstream_second".into());
         assert!(unsigned_route(&ambiguous, Some("upstream_second")).is_err());
     }
     #[tokio::test]
@@ -1231,17 +1338,21 @@ mod account_route_tests {
         let app = App {
             secret: vec![7; 32],
             config_path: path.to_string_lossy().into_owned(),
-            control: Arc::new(excel::control::Control::load(path.with_extension("policy")).unwrap()),
+            control: Arc::new(
+                excel::control::Control::load(path.with_extension("policy")).unwrap(),
+            ),
             suffix: "-excel".into(),
             allow_unsigned: true,
             clients: Mutex::new(BTreeMap::new()),
         };
         let result = unsigned_client(&app, None);
         std::fs::remove_file(path).unwrap();
-        assert!(result.is_err(), "missing identity must never select the first account");
+        assert!(
+            result.is_err(),
+            "missing identity must never select the first account"
+        );
     }
 }
-
 
 #[cfg(test)]
 mod complete_error_record_tests {
@@ -1249,37 +1360,107 @@ mod complete_error_record_tests {
     #[tokio::test]
     async fn records_before_stream_translation_and_http_truncation() {
         for status in [StatusCode::OK, StatusCode::BAD_REQUEST] {
-            let root=std::env::temp_dir().join(format!("excel-error-record-{}",uuid::Uuid::new_v4()));
+            let root =
+                std::env::temp_dir().join(format!("excel-error-record-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&root).unwrap();
-            let map=root.join("accounts.json");
-            std::fs::write(&map, r#"{"accounts":{"test":{"direct":true,"proxy":null}}}"#).unwrap();
-            let app=Arc::new(App { secret:vec![b'x';32],config_path:map.to_string_lossy().into_owned(),control:Arc::new(excel::control::Control::load(root.join("policy.json")).unwrap()),suffix:"-excel".into(),allow_unsigned:false,clients:Mutex::new(BTreeMap::new()) });
-            app.control.save(excel::admission::Policy {enabled:true,..Default::default()},Some(0)).unwrap();
-            let message=format!("field input rejected: {} END_OF_FULL_ERROR", "detail ".repeat(2000));
-            let event=json!({"type":"error","error":{"code":"new_provider_validation_error","type":"invalid_request_error","message":message,"param":"input[1]","details":{"constraint":"must be tool output"}}});
-            let payload=if status.is_success() { format!("event: error\ndata: {event}\n\n") } else { event.to_string() };
-            let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let address=listener.local_addr().unwrap();
-            let mock=Router::new().route("/",post(move || { let payload=payload.clone(); async move {(status,[("content-type","text/event-stream")],payload)} }));
-            let server=tokio::spawn(async move { axum::serve(listener,mock).await.unwrap(); });
-            let ctx=Context {account:"test".into(),scope:"error-record-test".into(),request_id:format!("req_record_{}",status.as_u16()),excel:true,key:None,expires:SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()+60};
-            let token=excel::auth::sign(&ctx,&app.secret).unwrap();
-            let source=json!({"model":"gpt-6-astra-excel","input":[{"role":"user","content":"diagnostic fixture"}],"client_metadata":{"_cpr_excel_bridge":token}});
-            let mut headers=HeaderMap::new();headers.insert("authorization","Bearer fixture_account_credential".parse().unwrap());
-            let endpoint: &'static str=Box::leak(format!("http://{address}/").into_boxed_str());
-            let result=open_events_at(app,Identity::Signed(Box::new(ctx.clone())),headers,source,None,endpoint).await;
+            let map = root.join("accounts.json");
+            std::fs::write(
+                &map,
+                r#"{"accounts":{"test":{"direct":true,"proxy":null}}}"#,
+            )
+            .unwrap();
+            let app = Arc::new(App {
+                secret: vec![b'x'; 32],
+                config_path: map.to_string_lossy().into_owned(),
+                control: Arc::new(excel::control::Control::load(root.join("policy.json")).unwrap()),
+                suffix: "-excel".into(),
+                allow_unsigned: false,
+                clients: Mutex::new(BTreeMap::new()),
+            });
+            app.control
+                .save(
+                    excel::admission::Policy {
+                        enabled: true,
+                        ..Default::default()
+                    },
+                    Some(0),
+                )
+                .unwrap();
+            let message = format!(
+                "field input rejected: {} END_OF_FULL_ERROR",
+                "detail ".repeat(2000)
+            );
+            let event = json!({"type":"error","error":{"code":"new_provider_validation_error","type":"invalid_request_error","message":message,"param":"input[1]","details":{"constraint":"must be tool output"}}});
+            let payload = if status.is_success() {
+                format!("event: error\ndata: {event}\n\n")
+            } else {
+                event.to_string()
+            };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let mock = Router::new().route(
+                "/",
+                post(move || {
+                    let payload = payload.clone();
+                    async move { (status, [("content-type", "text/event-stream")], payload) }
+                }),
+            );
+            let server = tokio::spawn(async move {
+                axum::serve(listener, mock).await.unwrap();
+            });
+            let ctx = Context {
+                account: "test".into(),
+                scope: "error-record-test".into(),
+                request_id: format!("req_record_{}", status.as_u16()),
+                excel: true,
+                key: None,
+                expires: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + 60,
+            };
+            let token = excel::auth::sign(&ctx, &app.secret).unwrap();
+            let source = json!({"model":"gpt-6-astra-excel","input":[{"role":"user","content":"diagnostic fixture"}],"client_metadata":{"_cpr_excel_bridge":token}});
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "authorization",
+                "Bearer fixture_account_credential".parse().unwrap(),
+            );
+            let endpoint: &'static str = Box::leak(format!("http://{address}/").into_boxed_str());
+            let result = open_events_at(
+                app,
+                Identity::Signed(Box::new(ctx.clone())),
+                headers,
+                source,
+                None,
+                endpoint,
+            )
+            .await;
             if status.is_success() {
-                let output=result.unwrap().collect::<Vec<_>>().await;
-                assert!(output.iter().any(|e| e.as_ref().is_ok_and(|v|v["type"]=="response.failed")));
+                let output = result.unwrap().collect::<Vec<_>>().await;
+                assert!(
+                    output
+                        .iter()
+                        .any(|e| e.as_ref().is_ok_and(|v| v["type"] == "response.failed"))
+                );
                 assert!(!format!("{output:?}").contains("END_OF_FULL_ERROR"));
-            } else { assert_eq!(result.err().unwrap().0,status); }
-            let text=std::fs::read_to_string(root.join("error-logs/upstream-errors.jsonl")).unwrap();
-            let record:Value=serde_json::from_str(text.trim()).unwrap();
-            let saved=if status.is_success() {&record["upstream_event"]} else {&record["upstream_body"]};
-            assert_eq!(saved["error"],event["error"]);
-            assert_eq!(record["request_id"],ctx.request_id);
-            assert_eq!(record["http_status"],status.as_u16());
-            server.abort(); std::fs::remove_dir_all(root).unwrap();
+            } else {
+                assert_eq!(result.err().unwrap().0, status);
+            }
+            let text =
+                std::fs::read_to_string(root.join("error-logs/upstream-errors.jsonl")).unwrap();
+            let record: Value = serde_json::from_str(text.trim()).unwrap();
+            let saved = if status.is_success() {
+                &record["upstream_event"]
+            } else {
+                &record["upstream_body"]
+            };
+            assert_eq!(saved["error"], event["error"]);
+            assert_eq!(record["request_id"], ctx.request_id);
+            assert_eq!(record["http_status"], status.as_u16());
+            server.abort();
+            std::fs::remove_dir_all(root).unwrap();
         }
     }
 }
@@ -1293,43 +1474,96 @@ mod policy_error_mapping_http_tests {
         let root = std::env::temp_dir().join(format!("excel-policy-map-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let map = root.join("accounts.json");
-        std::fs::write(&map, r#"{"accounts":{"test":{"direct":true,"proxy":null}}}"#).unwrap();
+        std::fs::write(
+            &map,
+            r#"{"accounts":{"test":{"direct":true,"proxy":null}}}"#,
+        )
+        .unwrap();
         let app = Arc::new(App {
-            secret: vec![b'x'; 32], config_path: map.to_string_lossy().into_owned(),
+            secret: vec![b'x'; 32],
+            config_path: map.to_string_lossy().into_owned(),
             control: Arc::new(excel::control::Control::load(root.join("policy.json")).unwrap()),
-            suffix: "-excel".into(), allow_unsigned: false, clients: Mutex::new(BTreeMap::new()),
+            suffix: "-excel".into(),
+            allow_unsigned: false,
+            clients: Mutex::new(BTreeMap::new()),
         });
-        app.control.save(excel::admission::Policy {
-            enabled: true, policy_errors_as_server_error: enabled, ..Default::default()
-        }, Some(0)).unwrap();
+        app.control
+            .save(
+                excel::admission::Policy {
+                    enabled: true,
+                    policy_errors_as_server_error: enabled,
+                    ..Default::default()
+                },
+                Some(0),
+            )
+            .unwrap();
         let count = Arc::new(AtomicUsize::new(0));
         let seen = count.clone();
         let payload = if status.is_success() {
-            format!("data: {}\n\ndata: {upstream}\n\n", json!({"type":"response.created","response":{"id":"resp_mapping"}}))
-        } else { upstream.to_string() };
+            format!(
+                "data: {}\n\ndata: {upstream}\n\n",
+                json!({"type":"response.created","response":{"id":"resp_mapping"}})
+            )
+        } else {
+            upstream.to_string()
+        };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let mock = Router::new().route("/", post(move |axum::Json(body): axum::Json<Value>| {
-            seen.fetch_add(1, Ordering::SeqCst);
-            assert!(body.to_string().contains("policy mapping fixture"));
-            assert!(!body.to_string().contains("请先依据原始请求"));
-            let payload = payload.clone();
-            async move { (status, [("content-type", "text/event-stream")], payload) }
-        }));
-        let server = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap(); });
-        let ctx = Context { account: "test".into(), scope: "mapping-test".into(),
-            request_id: format!("req_mapping_{}", uuid::Uuid::new_v4()), excel: true, key: None,
-            expires: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 60 };
+        let mock = Router::new().route(
+            "/",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                seen.fetch_add(1, Ordering::SeqCst);
+                assert!(body.to_string().contains("policy mapping fixture"));
+                assert!(!body.to_string().contains("请先依据原始请求"));
+                let payload = payload.clone();
+                async move { (status, [("content-type", "text/event-stream")], payload) }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, mock).await.unwrap();
+        });
+        let ctx = Context {
+            account: "test".into(),
+            scope: "mapping-test".into(),
+            request_id: format!("req_mapping_{}", uuid::Uuid::new_v4()),
+            excel: true,
+            key: None,
+            expires: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 60,
+        };
         let token = excel::auth::sign(&ctx, &app.secret).unwrap();
         let source = json!({"model":"gpt-6-astra-excel","input":[{"role":"user","content":"policy mapping fixture"}],"client_metadata":{"_cpr_excel_bridge":token}});
         let mut headers = HeaderMap::new();
-        headers.insert("authorization", "Bearer fixture_account_credential".parse().unwrap());
+        headers.insert(
+            "authorization",
+            "Bearer fixture_account_credential".parse().unwrap(),
+        );
         let endpoint: &'static str = Box::leak(format!("http://{address}/").into_boxed_str());
-        let result = open_events_at(app.clone(), Identity::Signed(Box::new(ctx.clone())), headers, source, None, endpoint).await;
+        let result = open_events_at(
+            app.clone(),
+            Identity::Signed(Box::new(ctx.clone())),
+            headers,
+            source,
+            None,
+            endpoint,
+        )
+        .await;
         let maps = enabled && excel::stream::policy_server_error(&upstream).is_some();
         if status.is_success() {
-            let events = result.unwrap().collect::<Vec<_>>().await.into_iter().collect::<Result<Vec<_>, _>>().unwrap();
-            let terminals: Vec<_> = events.iter().filter(|event| excel::stream::is_terminal(event)).collect();
+            let events = result
+                .unwrap()
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let terminals: Vec<_> = events
+                .iter()
+                .filter(|event| excel::stream::is_terminal(event))
+                .collect();
             assert_eq!(terminals.len(), 1);
             let event = terminals[0];
             assert_eq!(event["response"]["id"], "resp_mapping");
@@ -1339,30 +1573,72 @@ mod policy_error_mapping_http_tests {
                 assert_eq!(event["response"]["error"]["type"], "server_error");
                 assert_eq!(event["response"]["error"]["request_id"], ctx.request_id);
                 assert!(event["response"].get("incomplete_details").is_none());
-                if upstream.get("status").is_some() { assert_eq!(event["status"], 500); }
+                if upstream.get("status").is_some() {
+                    assert_eq!(event["status"], 500);
+                }
             } else if upstream["type"] == "response.incomplete" {
                 assert_eq!(event["type"], "response.incomplete");
-                assert_eq!(event["response"]["incomplete_details"], upstream["response"]["incomplete_details"]);
+                assert_eq!(
+                    event["response"]["incomplete_details"],
+                    upstream["response"]["incomplete_details"]
+                );
             } else {
-                assert_eq!(event["response"]["error"]["code"], excel::stream::failure_details(&upstream).0);
+                assert_eq!(
+                    event["response"]["error"]["code"],
+                    excel::stream::failure_details(&upstream).0
+                );
             }
             assert!(!event.to_string().contains("private mapping message"));
-            if let Some(usage) = upstream.pointer("/response/usage") { assert_eq!(&event["response"]["usage"], usage); }
+            if let Some(usage) = upstream.pointer("/response/usage") {
+                assert_eq!(&event["response"]["usage"], usage);
+            }
             if upstream.pointer("/response/output").is_some() {
-                assert_eq!(event["response"]["output"], json!([{"type":"message","content":[{"type":"output_text","text":"partial text"}]}]));
+                assert_eq!(
+                    event["response"]["output"],
+                    json!([{"type":"message","content":[{"type":"output_text","text":"partial text"}]}])
+                );
             }
         } else {
             let (actual_status, axum::Json(body)) = result.err().unwrap();
-            assert_eq!(actual_status, if maps { StatusCode::INTERNAL_SERVER_ERROR } else { status });
-            assert_eq!(body["error"]["type"], if maps { "server_error" } else { "excel_bridge_error" });
-            if maps { assert_eq!(body["error"]["code"], "server_error"); }
+            assert_eq!(
+                actual_status,
+                if maps {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                } else {
+                    status
+                }
+            );
+            assert_eq!(
+                body["error"]["type"],
+                if maps {
+                    "server_error"
+                } else {
+                    "excel_bridge_error"
+                }
+            );
+            if maps {
+                assert_eq!(body["error"]["code"], "server_error");
+            }
         }
-        assert_eq!(count.load(Ordering::SeqCst), 1, "mapping must not issue a retry");
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "mapping must not issue a retry"
+        );
         let text = std::fs::read_to_string(root.join("error-logs/upstream-errors.jsonl")).unwrap();
         let record: Value = serde_json::from_str(text.trim()).unwrap();
-        let original = if status.is_success() { &record["upstream_event"] } else { &record["upstream_body"] };
-        assert_eq!(excel::stream::failure_details(original), excel::stream::failure_details(&upstream));
-        if let Some(error) = upstream.get("error") { assert_eq!(&original["error"], error); }
+        let original = if status.is_success() {
+            &record["upstream_event"]
+        } else {
+            &record["upstream_body"]
+        };
+        assert_eq!(
+            excel::stream::failure_details(original),
+            excel::stream::failure_details(&upstream)
+        );
+        if let Some(error) = upstream.get("error") {
+            assert_eq!(&original["error"], error);
+        }
         assert_eq!(record["http_status"], status.as_u16());
         assert_eq!(record["request_id"], ctx.request_id);
         server.abort();
@@ -1373,7 +1649,15 @@ mod policy_error_mapping_http_tests {
     async fn both_settings_cover_http_and_sse_without_bridge_retries() {
         for enabled in [false, true] {
             for status in [StatusCode::OK, StatusCode::FORBIDDEN] {
-                for code in ["cyber_policy", "bio_policy", "misalignment_policy_violation", "content_filter", "invalid_prompt", "rate_limit_exceeded", "unknown"] {
+                for code in [
+                    "cyber_policy",
+                    "bio_policy",
+                    "misalignment_policy_violation",
+                    "content_filter",
+                    "invalid_prompt",
+                    "rate_limit_exceeded",
+                    "unknown",
+                ] {
                     probe(enabled, status, json!({"type":"error","status":403,"error":{"code":code,"message":"private mapping message"}})).await;
                 }
             }

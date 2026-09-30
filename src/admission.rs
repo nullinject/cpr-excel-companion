@@ -43,12 +43,12 @@ pub enum Channel {
 /// Excel = 无后缀请求也强制走 Excel（仅签名请求）；Native = 带 -excel 后缀也压回原生。
 pub type ModelChannels = BTreeMap<String, Channel>;
 
-/// 保留旧策略中的 Key 覆盖数据；当前执行路径不应用此字段。
+/// 已认证 Client Key 的模型通道覆盖；只选择通道，不授予模型或账户权限。
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeyRule {
     #[serde(default)]
-    pub models: BTreeMap<String, Channel>,
+    pub models: ModelChannels,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -57,10 +57,9 @@ pub struct Policy {
     pub enabled: bool,
     pub models: Scope,
     pub accounts: Scope,
-    pub client_keys: Scope,
     #[serde(default)]
     pub model_channels: ModelChannels,
-    /// 历史字段，键为 CPR 的 client key ID；保留数据，不作为路由或授权依据。
+    /// 按 CPR 已认证的 Client Key ID 和基础模型选择通道。
     #[serde(default)]
     pub key_rules: BTreeMap<String, KeyRule>,
     pub concurrency: usize,
@@ -77,7 +76,6 @@ impl Default for Policy {
             enabled: false,
             models: Scope::default(),
             accounts: Scope::default(),
-            client_keys: Scope::default(),
             model_channels: BTreeMap::new(),
             key_rules: BTreeMap::new(),
             concurrency: 1,
@@ -100,44 +98,51 @@ impl Policy {
             return Err("queue_timeout_ms must be between 1 and 600000");
         }
         if self.model_channels.len() > 200
-            || self.model_channels.keys().any(|m| {
-                m.is_empty() || m.len() > 256 || m.trim() != m
-            })
+            || self
+                .model_channels
+                .keys()
+                .any(|model| !valid_identifier(model))
         {
-            return Err("model_channels supports at most 200 models of 1 to 256 bytes");
+            return Err("model_channels supports at most 200 models of 1 to 256 trimmed bytes");
         }
         if self.key_rules.len() > 256
             || self.key_rules.iter().any(|(key, rule)| {
-                key.is_empty()
-                    || key.len() > 256
+                !valid_identifier(key)
                     || rule.models.len() > 200
-                    || rule.models.keys().any(|m| m.is_empty() || m.len() > 256)
+                    || rule.models.keys().any(|model| !valid_identifier(model))
             })
         {
-            return Err("key_rules supports at most 256 keys of 200 models each");
+            return Err("key_rules supports at most 256 keys of 200 trimmed models each");
         }
-        for scope in [&self.models, &self.accounts, &self.client_keys] {
+        for scope in [&self.models, &self.accounts] {
             if scope.allow.len() + scope.deny.len() > 200
                 || scope
                     .allow
                     .iter()
                     .chain(&scope.deny)
-                    .any(|value| value.is_empty() || value.len() > 256 || value.trim() != value)
+                    .any(|value| !valid_identifier(value))
             {
-                return Err("each scope supports at most 200 identifiers of 1 to 256 bytes");
+                return Err(
+                    "each scope supports at most 200 identifiers of 1 to 256 trimmed bytes",
+                );
             }
         }
         Ok(())
     }
-    pub fn permits_request(&self, model: &str, client_key_id: Option<&str>) -> bool {
-        // 有 Key 限制时缺失宿主身份必须拒绝，不能把匿名请求当成匹配。
-        self.enabled
-            && self.models.permits(model)
-            && match client_key_id {
-                Some(id) => self.client_keys.permits(id),
-                None => self.client_keys.allow.is_empty() && self.client_keys.deny.is_empty(),
-            }
+    /// Routing precedence: authenticated Key/model, global model, requested channel.
+    /// Admission and authorization are separate and cannot be bypassed by an override.
+    pub fn channel_for(&self, model: &str, client_key_id: &str, requested: Channel) -> Channel {
+        self.key_rules
+            .get(client_key_id)
+            .and_then(|rule| rule.models.get(model))
+            .or_else(|| self.model_channels.get(model))
+            .copied()
+            .unwrap_or(requested)
     }
+}
+
+fn valid_identifier(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 256 && value.trim() == value
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -211,16 +216,12 @@ mod tests {
     use super::*;
     #[test]
     fn scopes_fail_closed_and_deny_wins() {
-        let mut p = Policy {
-            enabled: true,
-            ..Policy::default()
-        };
-        p.client_keys.allow.insert("k1".into());
-        assert!(!p.permits_request("model", None));
-        assert!(p.permits_request("model", Some("k1")));
-        p.client_keys.deny.insert("k1".into());
-        assert!(!p.permits_request("model", Some("k1")));
-        assert!(!p.permits_request("model", Some("k2")));
+        let mut scope = Scope::default();
+        scope.allow.insert("allowed".into());
+        assert!(scope.permits("allowed"));
+        assert!(!scope.permits("other"));
+        scope.deny.insert("allowed".into());
+        assert!(!scope.permits("allowed"));
     }
     #[tokio::test]
     async fn reject_never_exceeds_limit() {

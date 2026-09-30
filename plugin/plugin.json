@@ -3,7 +3,7 @@
   "name": "excel-companion",
   "publisher": "nullinject",
   "displayName": "Excel Companion",
-  "version": "0.10.1",
+  "version": "1.0.0-rc.1",
   "description": "Excel 通道协议转换、监控与路由设置。出站、账号、代理及结算由 CPR 管理，无需独立网关。",
   "license": "Unlicense",
   "engines": {

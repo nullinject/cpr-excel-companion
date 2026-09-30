@@ -335,6 +335,26 @@ mod tests {
         assert!(p.event(event).unwrap().event.facts.is_empty());
     }
     #[test]
+    fn model_access_changed_preserves_http_status_code_and_nonretryable_kind() {
+        let body = br#"{"error":{"code":"basispoints_model_access_changed","type":"invalid_request_error","message":"private workspace and credential"}}"#;
+        for map_policy in [false, true] {
+            let error = http_failure(403, body, map_policy).failure.unwrap();
+            assert_eq!(error.status, Some(403));
+            assert_eq!(
+                error.code.as_deref(),
+                Some("basispoints_model_access_changed")
+            );
+            assert_eq!(error.kind, UpstreamFailureKind::PermissionDenied);
+            assert!(!error.message.contains("private"));
+        }
+        let mut projection = Projection::default();
+        let frame = projection.event(json!({"type":"response.failed","response":{"error":{"code":"basispoints_model_access_changed","type":"invalid_request_error"}}})).unwrap();
+        assert_eq!(
+            frame.failure.unwrap().kind,
+            UpstreamFailureKind::PermissionDenied
+        );
+    }
+    #[test]
     fn failure_never_claims_success_or_usage() {
         let frame = Projection::default().event(json!({"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded"}}})).unwrap();
         assert!(frame.event.facts.is_empty());

@@ -115,8 +115,9 @@ const selectedCount = computed(
             <RoutingSettings
               :policy="policy"
               :models="models"
+              :keys="keys"
               :suffix="info?.excelModelSuffix ?? '-excel'"
-              @change="(model, value) => setChannel(policy, model, value)"
+              @change="(model, value, keyId) => setChannel(policy, model, value, keyId)"
             />
           </section>
           <section

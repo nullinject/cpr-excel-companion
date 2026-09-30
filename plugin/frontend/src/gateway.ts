@@ -8,7 +8,6 @@ export interface Policy {
   enabled: boolean
   models: Scope
   accounts: Scope
-  client_keys: Scope
   model_channels: Record<string, Channel>
   key_rules: Record<string, { models: Record<string, Channel> }>
   concurrency: number
@@ -18,29 +17,62 @@ export interface Policy {
   policy_errors_as_server_error?: boolean
 }
 
-export function setChannel(
-  policy: Policy,
-  model: string,
-  channel: ChannelSetting,
-) {
-  if (channel === 'inherit')
-    delete policy.model_channels[model]
-  else policy.model_channels[model] = channel
+function own<T>(map: Record<string, T>, key: string): T | undefined {
+  return Object.hasOwn(map, key) ? map[key] : undefined
 }
 
-// 与 Control::enter 的全局通道和模型范围判断一致；账户仍由宿主选择。
-export function modelChannel(
-  policy: Policy,
-  model: string,
-  requested: string,
-  excel: boolean,
-): Channel {
-  const allowed
-    = !policy.models.deny.includes(requested)
-      && (!policy.models.allow.length || policy.models.allow.includes(requested))
+export function channelSetting(policy: Policy, model: string, keyId: string | null = null): ChannelSetting {
+  const channels = keyId ? own(policy.key_rules, keyId)?.models : policy.model_channels
+  return (channels && own(channels, model)) ?? 'inherit'
+}
+
+export function setChannel(policy: Policy, model: string, channel: ChannelSetting, keyId: string | null = null) {
+  const rule = keyId ? own(policy.key_rules, keyId) : undefined
+  if (keyId && !rule && channel === 'inherit')
+    return
+  // Computed property names avoid prototype setters; replacing the map notifies Vue.
+  const current = keyId ? rule?.models ?? {} : policy.model_channels
+  const models = channel === 'inherit' ? { ...current } : { ...current, [model]: channel }
+  if (channel === 'inherit')
+    delete models[model]
+  if (!keyId) {
+    policy.model_channels = models
+    return
+  }
+  if (Object.keys(models).length === 0) {
+    const rules = { ...policy.key_rules }
+    delete rules[keyId]
+    policy.key_rules = rules
+  }
+  else {
+    policy.key_rules = { ...policy.key_rules, [keyId]: { models } }
+  }
+}
+
+// Mirrors Policy::channel_for and Control::enter; actual account eligibility remains server-side.
+export function modelChannel(policy: Policy, model: string, requested: string, excel: boolean, keyId: string | null = null): Channel {
+  const allowed = !policy.models.deny.includes(requested)
+    && (!policy.models.allow.length || policy.models.allow.includes(requested))
   if (!policy.enabled || !allowed)
     return 'native'
-  return policy.model_channels[model] ?? (excel ? 'excel' : 'native')
+  const key = keyId ? channelSetting(policy, model, keyId) : 'inherit'
+  if (key !== 'inherit')
+    return key
+  return own(policy.model_channels, model) ?? (excel ? 'excel' : 'native')
+}
+
+// Observed/configured names are not a promise of upstream entitlement or availability.
+export function routingModels(policy: Policy | null, records: RequestRow[], suffix: string): string[] {
+  const names = new Set(Object.keys(policy?.model_channels ?? {}))
+  for (const rule of Object.values(policy?.key_rules ?? {})) {
+    for (const model of Object.keys(rule.models)) names.add(model)
+  }
+  for (const row of records) {
+    const name = suffix && row.model.endsWith(suffix) ? row.model.slice(0, -suffix.length) : row.model
+    if (name)
+      names.add(name)
+  }
+  return [...names].sort()
 }
 
 export interface RequestRow {
