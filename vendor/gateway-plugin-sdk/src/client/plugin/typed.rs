@@ -126,6 +126,21 @@ pub(super) fn decode_payload<P: DeserializeOwned>(
     Ok(typed_call(call, request, false))
 }
 
+pub(super) fn decode_upstream(
+    mut call: PluginCall,
+    stages: &'static [Stage],
+) -> Result<TypedCall<crate::call::upstream_adapter::UpstreamAdapterRequest>, PluginFault> {
+    validate_stage(&call, stages)?;
+    if !empty_object(&call.params) {
+        return Err(invalid_input());
+    }
+    let (request, body) =
+        crate::call::upstream_adapter::UpstreamAdapterRequest::decode(&call.payload)
+            .map_err(|_| invalid_input())?;
+    call.payload = body;
+    Ok(typed_call(call, request, true))
+}
+
 pub(super) fn encode_metadata<R: Serialize>(
     reply: TypedReply<R>,
 ) -> Result<CallReply, PluginFault> {
@@ -139,6 +154,22 @@ pub(super) fn encode_metadata<R: Serialize>(
     }
     let result = serde_json::to_value(result).map_err(|_| invalid_input())?;
     Ok(CallReply::unary(result, Vec::new()))
+}
+
+pub(super) fn encode_stream<R: Serialize>(reply: TypedReply<R>) -> Result<CallReply, PluginFault> {
+    let TypedReply {
+        result,
+        payload,
+        stream,
+    } = reply;
+    if !payload.is_empty() {
+        return Err(invalid_input());
+    }
+    Ok(CallReply::stream(
+        serde_json::to_value(result).map_err(|_| invalid_input())?,
+        payload,
+        stream.ok_or_else(invalid_input)?,
+    ))
 }
 
 pub(super) fn encode_metadata_with_payload<R: Serialize>(

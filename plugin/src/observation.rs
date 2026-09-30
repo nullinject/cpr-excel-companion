@@ -2,20 +2,72 @@
 //! 观察投递有界且不重投；转发失败只影响插件侧记录，不影响宿主结算。
 use crate::management::remote;
 use gateway_plugin_sdk::{
-    call::policy::ObserveRequest,
-    client::{Empty, TypedCall, TypedReply},
     ErrorCode, PluginFault,
+    call::observation::{Event, RequestCompleted},
+    client::{Empty, TypedCall, TypedReply},
 };
 
 pub async fn forward(
-    call: TypedCall<ObserveRequest>,
+    call: TypedCall<Event>,
     url: &str,
     secret: &[u8],
 ) -> Result<TypedReply<Empty>, PluginFault> {
-    let observation = call.request;
-    let payload = serde_json::to_vec(&observation)
-        .map_err(|_| PluginFault::new(ErrorCode::InvalidInput, "observation encoding failed"))?;
+    let Event::RequestCompleted(observation) = call.request else {
+        return Ok(TypedReply::new(Empty {}));
+    };
+    let payload = project_completion(&observation)?;
     // 观察回调不在请求路径上；转发失败只损失插件侧一条记录的终态合并。
-    let _ = remote(&call.host, url, secret, &observation.event_id, "observe", payload).await;
+    let _ = remote(
+        &call.host,
+        url,
+        secret,
+        &observation.event_id,
+        "observe",
+        payload,
+    )
+    .await;
     Ok(TypedReply::new(Empty {}))
+}
+
+fn project_completion(observation: &RequestCompleted) -> Result<Vec<u8>, PluginFault> {
+    let mut projected = serde_json::to_value(observation)
+        .map_err(|_| PluginFault::new(ErrorCode::InvalidInput, "observation encoding failed"))?;
+    // 桥接旧合同的顶层 failure 由新版完成事件中的 usage.failure 投影。
+    projected["failure"] = projected["usage"]["failure"].clone();
+    serde_json::to_vec(&projected)
+        .map_err(|_| PluginFault::new(ErrorCode::InvalidInput, "observation encoding failed"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn projects_new_completion_into_existing_bridge_contract() {
+        let event: Event = serde_json::from_value(serde_json::json!({
+            "event": "request_completed", "data": {
+                "event_id": "obs-1", "request_id": "req-1", "config_revision": 1,
+                "operation": "responses", "client_key_id": "key-1", "account_id": "account-1",
+                "completed_at_ms": 1000,
+                "terminal": {"outcome":"failed", "send_state":"sent", "attempt_count":1, "error_code":"rate_limit_exceeded"},
+                "usage": {"input_tokens":20,"output_tokens":3,"total_tokens":23,
+                    "timings":{"first_token_ms":10,"latency_ms":100},
+                    "failure":{"outcome":"failed","send_state":"sent","attempt_count":1,"upstream_status_code":429,"error_code":"rate_limit_exceeded"}}
+            }
+        })).unwrap();
+        let Event::RequestCompleted(completed) = event else {
+            panic!("wrong event")
+        };
+        let projected: cpr_excel_companion::observe::ObserveEvent =
+            serde_json::from_slice(&project_completion(&completed).unwrap()).unwrap();
+        assert_eq!(projected.client_key_id.as_deref(), Some("key-1"));
+        assert_eq!(projected.failure.unwrap().upstream_status_code, Some(429));
+        assert_eq!(
+            projected.terminal.unwrap().outcome,
+            cpr_excel_companion::observe::Outcome::Failed
+        );
+        let usage = projected.usage.unwrap();
+        assert_eq!(usage.total_tokens, Some(23));
+        assert_eq!(usage.timings.unwrap().first_token_ms, Some(10));
+    }
 }

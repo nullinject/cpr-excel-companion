@@ -1,10 +1,18 @@
 # CPR Excel Companion
 
-**v0.8.9 插件 + v0.8.4 独立桥接：宿主版本声明为 CPR >=3.16.0、<4.0.0。数据面经 CPR 原生 Provider 执行，保留计费与用量统计链路；验收范围和已知限制见下文。**
+**v0.9.0 插件 + v0.8.4 独立桥接：适配 CPR >=3.18.2、<3.19.0。数据面经 CPR 原生 Provider 执行，保留计费与用量统计链路；验收范围和已知限制见下文。**
 
 协议转换移植自 [Kaixxrua/excel-codex-bridge](https://github.com/Kaixxrua/excel-codex-bridge)。无需修改 CPR 源码；由插件、桥接服务与上游路由三部分组成。
 
 ## 宿主兼容范围
+
+当前插件固定采用 CPR v3.18.2（`e30aad475560b94db2d999e2251d180e45d52671`）的 SDK：清单 v2、进程协议 v2、中间件 v3、统一 `observer` 完成事件。旧的 `permissions`、`request_lifecycle` 和 `usage` 声明不再使用。完成事件中的 `usage.failure` 投影到桥接现有的错误字段，终态、用量与耗时仍来自宿主。
+
+安装 0.9.0 时必须同时迁移绑定：保留原 `attempt` 范围，将原完成／用量观察合并为 `nullinject.excel-companion.observer`、`stage=observation`、`failurePolicy=observe`、`event=request_completed`。不能仅修改旧包的兼容版本号。旧的 3.16 / 3.17 宿主继续使用对应旧版插件。
+
+桥接使用独立 Docker Compose 网络，不能再使用 `network_mode: service:codex-proxy-rs`。插件控制地址为 `http://excel-companion-bridge:8089/_control`；桥接端口仅发布到宿主回环（例如 `127.0.0.1:8093:8089`），由反代路由访问。CPR 的 `openai.api.base_url` 保持已配置的桥接地址。这样宿主内部更新、容器重启不会让桥接留在旧网络命名空间，导致模型列表和请求入口返回 502。
+
+CPR 3.18.2 的 `upstream_adapter` 可提供受管 HTTP/SSE、账号代理、认证、结算与续接基础，已具备去掉外置转发链路的接口条件。当前版本仍保留桥接的附件上传、工具转换、流式解析及续接缓存；这些路径完整迁移并验证前，不停用桥接或把 Base URL 切回原生地址。
 
 ### v0.8.9：可选 Policy 错误分类
 
@@ -71,7 +79,7 @@ Codex Desktop CLI 0.158.0-alpha.2.1 使用真实 Key，各模型 3 轮：创建�
 ## 工作方式
 
 ```text
-客户端 ──▶ CPR（官方 3.16.0）
+客户端 ──▶ CPR（官方 3.18.2）
               │ attempt 插件：签发 HMAC 上下文，识别 -excel 后缀模型
               │ openai.api.base_url 指向桥接
               ▼
@@ -177,10 +185,10 @@ v0.1.1 确实有 Key 列表和 client_keys 配置，但当时 Control::enter 传
 | --- | --- |
 | `secretFile` | 插件进程可读的共享密钥路径，默认 `/run/secrets/excel-bridge.key` |
 | `isolationScope` | 实例作用域，必填 |
-| `bridgeControlUrl` | 桥接控制地址，共享 netns 部署用 `http://127.0.0.1:8089/_control` |
+| `bridgeControlUrl` | 桥接控制地址；独立 Compose 网络使用 `http://excel-companion-bridge:8089/_control` |
 | `showPage` | 管理页开关，默认 true |
 
-上游路由：`openai.api.base_url` 指向桥接。宿主无回环豁免，base_url 必须经账户代理可达；共享 netns 直连仅适用于账户无代理的部署。桥接挂载用目录。CPR 容器重建后需重建桥接容器（`network_mode: service:` 的 netns 引用会失效）。
+上游路由：`openai.api.base_url` 指向桥接。宿主无回环豁免，base_url 必须经账户代理可达；桥接使用独立 Compose 网络，控制面通过服务名直连，数据面仍经既有反代入口。桥接挂载用目录。不要使用共享 netns，CPR 重启后该引用可能失效。
 
 ## 开发验证
 

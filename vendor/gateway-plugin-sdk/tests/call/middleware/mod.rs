@@ -30,6 +30,10 @@ fn middleware_capability_and_mounts_have_one_stable_wire_vocabulary() {
 #[test]
 fn middleware_request_keeps_body_out_of_json_and_rejects_unknown_fields() {
     let request = MiddlewareRequestHead {
+        settings_sources: serde_json::Value::Null,
+        settings: serde_json::Value::Null,
+        client_key_id: "fixture-key".into(),
+        account_group_ids: vec!["fixture-group".into()],
         request_id: "request-1".into(),
         mount: MiddlewareMount::Attempt,
         attempt_index: Some(2),
@@ -44,7 +48,6 @@ fn middleware_request_keeps_body_out_of_json_and_rejects_unknown_fields() {
             name: "x-feature".into(),
             value: b"enabled".to_vec(),
         }],
-        body_visible: true,
     };
     let wire = serde_json::to_value(&request).unwrap();
     assert_eq!(wire["mount"], "attempt");
@@ -64,6 +67,7 @@ fn middleware_request_keeps_body_out_of_json_and_rejects_unknown_fields() {
 #[test]
 fn next_distinguishes_preserve_from_replace_empty_and_uses_incremental_headers() {
     let preserve = MiddlewareNextRequest {
+        settings: None,
         protocol: None,
         header_mutations: Vec::new(),
         body: MiddlewareRequestBody::Preserve,
@@ -75,6 +79,7 @@ fn next_distinguishes_preserve_from_replace_empty_and_uses_incremental_headers()
     );
 
     let replace = MiddlewareNextRequest {
+        settings: None,
         protocol: Some("xai".into()),
         header_mutations: vec![
             MiddlewareHeaderMutation::Remove {
@@ -108,6 +113,7 @@ fn response_body_modes_distinguish_transfer_empty_and_plugin_stream() {
         framing: MiddlewareBodyFraming::SseEvent,
     };
     let next = MiddlewareNextResponse {
+        metadata: None,
         response: "opaque-response".into(),
         protocol: "openai".into(),
         status: 200,

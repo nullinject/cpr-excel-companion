@@ -164,16 +164,23 @@ pub struct HostReply {
 #[derive(Clone)]
 pub struct HostClient {
     parent_id: u64,
-    deadline: Instant,
+    deadline: tokio::sync::watch::Receiver<Option<Instant>>,
     cancellation: CallCancellation,
     callbacks: Arc<CallbackRegistry>,
     output: Output,
     maximum_stream_chunk_bytes: usize,
+    credits: Arc<CreditWindow>,
 }
 
 impl HostClient {
-    pub(crate) const fn maximum_stream_chunk_bytes(&self) -> usize {
-        self.maximum_stream_chunk_bytes
+    pub(crate) fn maximum_stream_chunk_bytes(&self) -> usize {
+        let window = lock_unpoisoned(&self.credits.state).maximum_bytes;
+        if window == 0 {
+            self.maximum_stream_chunk_bytes
+        } else {
+            self.maximum_stream_chunk_bytes
+                .min(usize::try_from(window).unwrap_or(usize::MAX))
+        }
     }
 
     /// 发起一次与父调用关联的宿主回调。
@@ -209,7 +216,7 @@ impl HostClient {
         let sent = tokio::select! {
             biased;
             () = self.cancellation.cancelled() => Err(SessionError::Cancelled),
-            () = tokio::time::sleep_until(self.deadline) => Err(SessionError::Timeout),
+            () = callback_deadline(self.deadline.clone()) => Err(SessionError::Timeout),
             result = self.output.send_data(frame) => result,
         };
         if let Err(error) = sent {
@@ -223,7 +230,7 @@ impl HostClient {
                 self.callbacks.retire(id);
                 Err(SessionError::Cancelled)
             }
-            () = tokio::time::sleep_until(self.deadline) => {
+            () = callback_deadline(self.deadline.clone()) => {
                 self.callbacks.retire(id);
                 Err(SessionError::Timeout)
             }
@@ -292,10 +299,10 @@ enum StreamSource {
     Pull(Box<dyn PullResponseStream>),
 }
 
-pub(crate) type PullResponseFuture<'a> =
+pub type PullResponseFuture<'a> =
     Pin<Box<dyn Future<Output = Option<Result<Vec<u8>, PluginFault>>> + Send + 'a>>;
 
-pub(crate) trait PullResponseStream: Send {
+pub trait PullResponseStream: Send {
     fn next(&mut self) -> PullResponseFuture<'_>;
 }
 
@@ -329,7 +336,8 @@ impl ResponseStream {
         )
     }
 
-    pub(crate) fn pull(source: Box<dyn PullResponseStream>) -> Self {
+    /// 按消费进度拉取下一帧；返回 None 表示完成，丢弃流会丢弃生产者。
+    pub fn pull(source: Box<dyn PullResponseStream>) -> Self {
         Self {
             source: StreamSource::Pull(source),
             declared_capacity: 1,
@@ -355,7 +363,7 @@ impl ResponseStream {
         Ok(())
     }
 
-    async fn next(&mut self) -> Option<Result<Vec<u8>, PluginFault>> {
+    pub(crate) async fn next(&mut self) -> Option<Result<Vec<u8>, PluginFault>> {
         match &mut self.source {
             StreamSource::Buffered(chunks) => chunks.pop_front().map(Ok),
             StreamSource::Channel(receiver) => receiver.recv().await,
@@ -535,13 +543,13 @@ impl Output {
     async fn send_data_until(
         &self,
         frame: Frame,
-        deadline: Instant,
+        deadline: Option<Instant>,
         cancellation: &CallCancellation,
     ) -> Result<(), SessionError> {
         tokio::select! {
             biased;
             () = cancellation.cancelled() => Err(SessionError::Cancelled),
-            () = tokio::time::sleep_until(deadline) => Err(SessionError::Timeout),
+            () = wait_deadline(deadline) => Err(SessionError::Timeout),
             result = self.send_data(frame) => result,
         }
     }
@@ -951,15 +959,18 @@ impl SessionDriver {
         let deadline = Instant::now()
             .checked_add(Duration::from_millis(context.timeout_ms))
             .ok_or(SessionError::Protocol)?;
+        let deadline = Some(deadline);
+        let (deadline_source, callback_deadline) = tokio::sync::watch::channel(deadline);
         let credits = Arc::new(CreditWindow::default());
         let (cancellation, cancellation_signal) = CancellationSource::new();
         let host = HostClient {
             parent_id: id,
-            deadline,
+            deadline: callback_deadline,
             cancellation: cancellation_signal.clone(),
             callbacks: Arc::clone(&self.callbacks),
             output: self.output.clone(),
             maximum_stream_chunk_bytes: self.config.maximum_stream_chunk_bytes,
+            credits: credits.clone(),
         };
         let call = PluginCall {
             method,
@@ -987,6 +998,7 @@ impl SessionDriver {
                 output,
                 lifecycle,
                 deadline,
+                deadline_source,
                 maximum_stream_chunk_bytes,
                 maximum_chunks,
             )
@@ -1060,7 +1072,8 @@ async fn run_call(
     credits: Arc<CreditWindow>,
     output: Output,
     lifecycle: LifecycleHooks,
-    deadline: Instant,
+    deadline: Option<Instant>,
+    deadline_source: tokio::sync::watch::Sender<Option<Instant>>,
     maximum_stream_chunk_bytes: usize,
     maximum_chunks: usize,
 ) -> Result<(), SessionError> {
@@ -1069,7 +1082,7 @@ async fn run_call(
     let response = tokio::select! {
         biased;
         () = cancellation.cancelled() => return Ok(()),
-        () = tokio::time::sleep_until(deadline) => {
+        () = wait_deadline(deadline) => {
             lifecycle.cancel(context.clone());
             output.send_control(fault_frame(
                 id,
@@ -1154,12 +1167,18 @@ async fn run_call(
     {
         return Ok(());
     }
+    let deadline = if context.resource_stream {
+        None
+    } else {
+        deadline
+    };
+    deadline_source.send_replace(deadline);
     let mut sequence = 0_u64;
     loop {
         let item = tokio::select! {
             biased;
             () = cancellation.cancelled() => return Ok(()),
-            () = tokio::time::sleep_until(deadline) => {
+            () = wait_deadline(deadline) => {
                 lifecycle.cancel(context.clone());
                 output.send_control(end_frame(
                     id,
@@ -1231,7 +1250,7 @@ async fn send_initial(
     frame: Frame,
     context: &CallContext,
     lifecycle: &LifecycleHooks,
-    deadline: Instant,
+    deadline: Option<Instant>,
     cancellation: &CallCancellation,
 ) -> Result<bool, SessionError> {
     match output.send_data_until(frame, deadline, cancellation).await {
@@ -1255,7 +1274,7 @@ async fn send_stream_data(
     id: u64,
     context: &CallContext,
     lifecycle: &LifecycleHooks,
-    deadline: Instant,
+    deadline: Option<Instant>,
     cancellation: &CallCancellation,
 ) -> Result<bool, SessionError> {
     match output.send_data_until(frame, deadline, cancellation).await {
@@ -1313,7 +1332,7 @@ impl CreditWindow {
 
     async fn initial_window(
         &self,
-        deadline: Instant,
+        deadline: Option<Instant>,
         cancellation: &CallCancellation,
     ) -> Result<u64, SessionError> {
         loop {
@@ -1327,7 +1346,7 @@ impl CreditWindow {
             tokio::select! {
                 biased;
                 () = cancellation.cancelled() => return Err(SessionError::Cancelled),
-                () = tokio::time::sleep_until(deadline) => return Err(SessionError::Timeout),
+                () = wait_deadline(deadline) => return Err(SessionError::Timeout),
                 () = changed => {}
             }
         }
@@ -1336,7 +1355,7 @@ impl CreditWindow {
     async fn take(
         &self,
         bytes: u64,
-        deadline: Instant,
+        deadline: Option<Instant>,
         cancellation: &CallCancellation,
     ) -> Result<(), SessionError> {
         loop {
@@ -1355,7 +1374,7 @@ impl CreditWindow {
             tokio::select! {
                 biased;
                 () = cancellation.cancelled() => return Err(SessionError::Cancelled),
-                () = tokio::time::sleep_until(deadline) => return Err(SessionError::Timeout),
+                () = wait_deadline(deadline) => return Err(SessionError::Timeout),
                 () = changed => {}
             }
         }
@@ -1431,4 +1450,23 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+async fn wait_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn callback_deadline(mut deadline: tokio::sync::watch::Receiver<Option<Instant>>) {
+    loop {
+        let current = *deadline.borrow_and_update();
+        tokio::select! {
+            () = wait_deadline(current) => return,
+            changed = deadline.changed() => {
+                if changed.is_err() { return wait_deadline(current).await; }
+            }
+        }
+    }
 }

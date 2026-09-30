@@ -3,8 +3,9 @@ use std::{collections::VecDeque, num::NonZeroUsize};
 use crate::{
     ErrorCode, PluginFault,
     call::middleware::{
-        BODY_CLOSE_METHOD, BODY_READ_METHOD, MiddlewareBodyClose, MiddlewareBodyCloseResult,
-        MiddlewareBodyDisposition, MiddlewareBodyFrame, MiddlewareBodyFraming,
+        BODY_CLOSE_METHOD, BODY_FACTS_METHOD, BODY_READ_METHOD, MiddlewareBodyClose,
+        MiddlewareBodyCloseResult, MiddlewareBodyDisposition, MiddlewareBodyFacts,
+        MiddlewareBodyFactsResult, MiddlewareBodyFrame, MiddlewareBodyFraming,
         MiddlewareBodyHandle, MiddlewareBodyRead, MiddlewareBodyReadResult, MiddlewareResponseBody,
     },
 };
@@ -13,6 +14,7 @@ use super::super::session::{
     HostClient, PullResponseFuture, PullResponseStream, ResponseStream, SessionError, StreamSender,
 };
 use super::invalid_input;
+use crate::client::read::PendingRead;
 
 const MAXIMUM_MAPPED_FRAMES_PER_SOURCE: usize = 64;
 const MAXIMUM_MAPPED_BYTES_PER_SOURCE: usize = 8 * 1024 * 1024;
@@ -28,7 +30,9 @@ enum MiddlewareBodySource {
         body: MiddlewareBodyHandle,
         host: HostClient,
         touched: bool,
+        include_facts: bool,
         last_source_id: u64,
+        read: PendingRead<Result<Option<MiddlewareBodyFrame>, PluginFault>>,
     },
     Plugin {
         framing: MiddlewareBodyFraming,
@@ -86,12 +90,15 @@ impl MiddlewareBody {
 
     /// 拉取下一完整 frame。调用后该 opaque handle 不能再作为未读直通返回。
     /// 只读观察并原样交付时使用 [`Self::inspect_frames`]，由 SDK 保留源帧。
+    /// 取消等待后可继续同一次读取，包括尚未完成的事实快照读取。
     pub async fn read(&mut self) -> Result<Option<MiddlewareBodyFrame>, PluginFault> {
         let MiddlewareBodySource::Host {
             body,
             host,
             touched,
+            include_facts,
             last_source_id,
+            read,
         } = &mut self.source
         else {
             return Err(PluginFault::new(
@@ -100,38 +107,24 @@ impl MiddlewareBody {
             ));
         };
         *touched = true;
-        let maximum_bytes =
-            u32::try_from(host.maximum_stream_chunk_bytes()).map_err(|_| invalid_input())?;
-        let reply = host
-            .call(
-                BODY_READ_METHOD,
-                serde_json::to_value(MiddlewareBodyRead {
-                    handle: body.handle.clone(),
-                    maximum_bytes,
-                })
-                .map_err(|_| invalid_input())?,
-                Vec::new(),
-            )
-            .await
-            .map_err(SessionError::into_plugin_fault)?;
-        let result: MiddlewareBodyReadResult =
-            serde_json::from_value(reply.result).map_err(|_| invalid_input())?;
-        if result.framing != body.framing
-            || (result.eof && result.source_id != 0)
-            || (!result.eof && (result.source_id == 0 || result.source_id <= *last_source_id))
-        {
-            return Err(invalid_input());
+        let frame = read
+            .run(|| read_frame(body.clone(), host.clone(), *include_facts, *last_source_id))
+            .await?;
+        if let Some(frame) = &frame {
+            *last_source_id = frame.source_id();
         }
-        if result.eof {
-            if result.terminal || !reply.payload.is_empty() {
-                return Err(invalid_input());
-            }
-            return Ok(None);
+        Ok(frame)
+    }
+
+    /// 在读取或映射每个源帧时取得完整宿主事实，普通透传不产生额外快照开销。
+    /// 必须在 `map_frames` / `inspect_frames` 前调用。
+    pub fn with_facts(mut self) -> Result<Self, PluginFault> {
+        match &mut self.source {
+            MiddlewareBodySource::Host { include_facts, .. } => *include_facts = true,
+            MiddlewareBodySource::Empty => {}
+            MiddlewareBodySource::Plugin { .. } => return Err(invalid_input()),
         }
-        *last_source_id = result.source_id;
-        MiddlewareBodyFrame::from_source(reply.payload, result.terminal, result.source_id)
-            .map(Some)
-            .map_err(|_| invalid_input())
+        Ok(self)
     }
 
     /// 提前关闭宿主正文句柄。父调用取消或结束也会由 Runtime 兜底回收。
@@ -216,7 +209,9 @@ impl MiddlewareBody {
                 body,
                 host,
                 touched: false,
+                include_facts: false,
                 last_source_id: 0,
+                read: PendingRead::default(),
             },
         }
     }
@@ -244,6 +239,70 @@ impl MiddlewareBody {
             }
         }
     }
+}
+
+async fn read_frame(
+    body: MiddlewareBodyHandle,
+    host: HostClient,
+    include_facts: bool,
+    last_source_id: u64,
+) -> Result<Option<MiddlewareBodyFrame>, PluginFault> {
+    let maximum_bytes =
+        u32::try_from(host.maximum_stream_chunk_bytes()).map_err(|_| invalid_input())?;
+    let reply = host
+        .call(
+            BODY_READ_METHOD,
+            serde_json::to_value(MiddlewareBodyRead {
+                handle: body.handle.clone(),
+                maximum_bytes,
+            })
+            .map_err(|_| invalid_input())?,
+            Vec::new(),
+        )
+        .await
+        .map_err(SessionError::into_plugin_fault)?;
+    let result: MiddlewareBodyReadResult =
+        serde_json::from_value(reply.result).map_err(|_| invalid_input())?;
+    if result.framing != body.framing
+        || (result.eof && result.source_id != 0)
+        || (!result.eof && (result.source_id == 0 || result.source_id <= last_source_id))
+    {
+        return Err(invalid_input());
+    }
+    if result.eof {
+        if result.terminal || !reply.payload.is_empty() {
+            return Err(invalid_input());
+        }
+        return Ok(None);
+    }
+    let mut frame =
+        MiddlewareBodyFrame::from_source(reply.payload, result.terminal, result.source_id)
+            .map_err(|_| invalid_input())?;
+    if include_facts {
+        let reply = host
+            .call(
+                BODY_FACTS_METHOD,
+                serde_json::to_value(MiddlewareBodyFacts {
+                    handle: body.handle.clone(),
+                    source_id: result.source_id,
+                })
+                .map_err(|_| invalid_input())?,
+                Vec::new(),
+            )
+            .await
+            .map_err(SessionError::into_plugin_fault)?;
+        let result: MiddlewareBodyFactsResult =
+            serde_json::from_value(reply.result).map_err(|_| invalid_input())?;
+        if result.present {
+            frame.facts = Some(Box::new(
+                crate::call::model::ExecutionEvent::decode(&reply.payload)
+                    .map_err(|_| invalid_input())?,
+            ));
+        } else if !reply.payload.is_empty() {
+            return Err(invalid_input());
+        }
+    }
+    Ok(Some(frame))
 }
 
 struct MappedBody<F> {

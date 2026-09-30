@@ -4,6 +4,7 @@ pub mod catalog;
 pub mod data;
 pub mod frontend_authentication;
 pub mod host;
+pub mod key_budgets;
 pub mod management;
 pub mod middleware;
 pub mod model;
@@ -11,3 +12,6 @@ pub mod observation;
 pub mod policy;
 pub mod registration;
 pub mod resources;
+pub mod upstream_adapter;
+
+pub mod services;

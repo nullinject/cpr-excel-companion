@@ -1,10 +1,14 @@
 //! 统一请求/响应中间件的跨进程数据合同。
 
+pub mod http;
+pub mod websocket;
+
 use serde::{Deserialize, Serialize};
 
 pub const HANDLE_METHOD: &str = "middleware.handle";
 pub const NEXT_METHOD: &str = "host.middleware.next";
 pub const BODY_READ_METHOD: &str = "host.middleware.body_read";
+pub const BODY_FACTS_METHOD: &str = "host.middleware.body_facts";
 pub const BODY_CLOSE_METHOD: &str = "host.middleware.body_close";
 
 const BODY_FRAME_PREFIX: [u8; 4] = *b"GMB1";
@@ -56,11 +60,17 @@ pub enum MiddlewareHeaderMutation {
     Append { name: String, value: Vec<u8> },
 }
 
-/// `middleware.handle` 的请求头。正文位于 RPC binary payload；未授权读取时为空。
+/// `middleware.handle` 的请求头。完整正文位于 RPC binary payload。
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MiddlewareRequestHead {
+    pub settings_sources: serde_json::Value,
+    /// 当前请求的完整有效执行设置；尚未建立可改写设置的边界使用 null。
+    #[serde(default)]
+    pub settings: serde_json::Value,
     pub request_id: String,
+    pub client_key_id: String,
+    pub account_group_ids: Vec<String>,
     pub mount: MiddlewareMount,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempt_index: Option<u32>,
@@ -76,8 +86,6 @@ pub struct MiddlewareRequestHead {
     pub account_id: Option<String>,
     #[serde(default)]
     pub headers: Vec<MiddlewareHeader>,
-    /// `true` 表示 binary payload 是完整请求正文；`false` 表示正文未向插件投影。
-    pub body_visible: bool,
 }
 
 /// 调用 next 时如何处理宿主保存的原始请求正文。
@@ -98,7 +106,7 @@ pub enum RequestFeature {
     JsonSchema,
 }
 
-/// middleware v2：插件承担的功能转换与额外上游需求，均不覆盖正文推导的事实。
+/// 插件承担的功能转换与额外上游需求，均不覆盖正文推导的事实。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CapabilityDeclaration {
@@ -110,6 +118,9 @@ pub struct CapabilityDeclaration {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MiddlewareNextRequest {
+    /// None 保留原设置；Some 是完整替换，字段删除必须符合对应设置类型。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol: Option<String>,
     #[serde(default)]
@@ -133,6 +144,8 @@ pub struct MiddlewareBodyHandle {
 pub struct MiddlewareNextResponse {
     /// 绑定本次 next 结果的宿主响应身份；只能在当前父调用内返还。
     pub response: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Box<super::model::facts::ProviderCallMetadata>>,
     pub protocol: String,
     pub status: u16,
     #[serde(default)]
@@ -141,7 +154,7 @@ pub struct MiddlewareNextResponse {
     pub body: Option<MiddlewareBodyHandle>,
 }
 
-/// 最终正文来源。`PassThrough` 不读取正文，也不要求响应正文读写授权。
+/// 最终正文来源；`PassThrough` 直接转交下游正文，不触发读取。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MiddlewareResponseBody {
@@ -173,6 +186,20 @@ pub struct MiddlewareResponseHead {
 pub struct MiddlewareBodyRead {
     pub handle: String,
     pub maximum_bytes: u32,
+}
+
+/// 读取当前源 frame 的宿主事实，不消费或复制原结算所有权。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MiddlewareBodyFacts {
+    pub handle: String,
+    pub source_id: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MiddlewareBodyFactsResult {
+    pub present: bool,
 }
 
 /// `eof` 只在空 payload 时成立；结构化 frame 不拆成任意网络分块。
@@ -209,8 +236,10 @@ pub enum MiddlewareBodyDisposition {
 }
 
 /// 插件替换正文流中的一个完整 frame；正文不进入 JSON metadata。
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq)]
 pub struct MiddlewareBodyFrame {
+    /// 按需读取的来源快照，不进入插件返回的正文编码。
+    pub facts: Option<Box<super::model::ExecutionEvent>>,
     pub payload: Vec<u8>,
     pub terminal: bool,
     source_id: u64,
@@ -221,6 +250,7 @@ impl MiddlewareBodyFrame {
     #[must_use]
     pub fn new(payload: Vec<u8>, terminal: bool) -> Self {
         Self {
+            facts: None,
             payload,
             terminal,
             source_id: 0,
@@ -238,6 +268,7 @@ impl MiddlewareBodyFrame {
             return Err(MiddlewareBodyFrameError);
         }
         Ok(Self {
+            facts: None,
             payload,
             terminal,
             source_id,
@@ -317,6 +348,7 @@ impl MiddlewareBodyFrame {
             return Err(MiddlewareBodyFrameError);
         }
         Ok(Self {
+            facts: None,
             payload: bytes[14..].to_vec(),
             terminal,
             source_id,

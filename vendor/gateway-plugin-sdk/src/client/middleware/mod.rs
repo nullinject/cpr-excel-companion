@@ -1,5 +1,16 @@
+mod service;
+pub use service::{ServiceCall, ServiceNext, ServiceResponse, TypedServiceCall};
 mod body;
+mod call;
+pub use call::{MiddlewareCall, MiddlewareResult};
+mod http;
+mod websocket;
+pub use websocket::{
+    WebSocketCall, WebSocketDirection, WebSocketKind, WebSocketMessage, WebSocketNext,
+    WebSocketPayload, WebSocketSender, WebSocketSession,
+};
 mod plugin;
+pub use http::{HttpBody, HttpCall, HttpFrame, HttpNext, HttpRequest, HttpResponse};
 
 pub use body::{MiddlewareBody, MiddlewareBodySender};
 pub use plugin::MiddlewarePlugin;
@@ -15,24 +26,24 @@ use crate::{
 
 use super::session::{CallCancellation, CallReply, HostClient, PluginCall, SessionError};
 
-/// 作者可读取并按授权修改的一次中间件请求。
+/// 作者可读取并修改的一次中间件请求。
 ///
-/// 直接修改公开的 `head`/`body` 会由 [`MiddlewareNext::run`] 与原投影比较；
+/// 直接修改公开的 `head`/`body` 会由 [`MiddlewareNext::run`] 与原始输入比较；
 /// `replace_body` 还可明确表达“替换为空正文”。
 pub struct MiddlewareRequest {
     pub head: MiddlewareRequestHead,
     pub body: Vec<u8>,
     original_protocol: String,
+    original_settings: serde_json::Value,
     original_headers: Vec<MiddlewareHeader>,
     original_body: Vec<u8>,
-    body_visible: bool,
     body_replaced: bool,
     header_mutations: Vec<MiddlewareHeaderMutation>,
     capabilities: Option<crate::call::middleware::CapabilityDeclaration>,
 }
 
 impl MiddlewareRequest {
-    /// 仅 middleware v2 的 request 阶段可声明转换；须同时替换正文并负责响应还原。
+    /// 仅 request 阶段可声明转换；须同时替换正文并负责响应还原。
     pub fn declare_capabilities(
         &mut self,
         declaration: crate::call::middleware::CapabilityDeclaration,
@@ -74,9 +85,7 @@ impl MiddlewareRequest {
             self.header_mutations,
             self.head.headers,
         );
-        let changed_body = self.body_replaced
-            || self.body != self.original_body
-            || (!self.body_visible && !self.body.is_empty());
+        let changed_body = self.body_replaced || self.body != self.original_body;
         let (body, payload) = if changed_body {
             (MiddlewareRequestBody::Replace, self.body)
         } else {
@@ -84,6 +93,8 @@ impl MiddlewareRequest {
         };
         (
             MiddlewareNextRequest {
+                settings: (self.head.settings != self.original_settings)
+                    .then_some(self.head.settings),
                 protocol,
                 header_mutations,
                 body,
@@ -175,8 +186,9 @@ impl MiddlewareNext {
     }
 }
 
-/// 作者返回的响应；原 next 响应头以增量方式修改，隐藏字段仍由 Runtime 保存。
+/// 作者返回的响应；完整 next 响应头以增量方式修改，未改写的字节保持原样。
 pub struct MiddlewareResponse {
+    pub metadata: Option<Box<crate::call::model::facts::ProviderCallMetadata>>,
     pub protocol: String,
     pub status: u16,
     pub headers: Vec<MiddlewareHeader>,
@@ -204,6 +216,7 @@ impl MiddlewareResponse {
             MiddlewareBody::from_host(body, host)
         });
         Ok(Self {
+            metadata: response.metadata,
             protocol: response.protocol.clone(),
             status: response.status,
             headers: response.headers.clone(),
@@ -225,6 +238,7 @@ impl MiddlewareResponse {
         body: MiddlewareBody,
     ) -> Self {
         Self {
+            metadata: None,
             protocol: protocol.into(),
             status,
             headers,
@@ -279,7 +293,7 @@ impl MiddlewareResponse {
 }
 
 /// 交给中间件作者的一次真实调用。
-pub struct MiddlewareCall {
+pub struct RequestCall {
     pub context: CallContext,
     pub request: MiddlewareRequest,
     pub next: MiddlewareNext,
@@ -287,7 +301,7 @@ pub struct MiddlewareCall {
     pub host: HostClient,
 }
 
-impl MiddlewareCall {
+impl RequestCall {
     /// 从 `middleware.handle` RPC 解码并交叉检查宿主签发的 mount/身份。
     pub fn try_from(call: PluginCall) -> Result<Self, PluginFault> {
         if call.method != HANDLE_METHOD {
@@ -309,7 +323,6 @@ impl MiddlewareCall {
             || (mount == MiddlewareMount::Request && head.attempt_index.is_some())
             || (mount == MiddlewareMount::Attempt
                 && head.attempt_index.is_none_or(|attempt| attempt == 0))
-            || !head.body_visible && !call.payload.is_empty()
         {
             return Err(invalid_input());
         }
@@ -320,9 +333,9 @@ impl MiddlewareCall {
         Ok(Self {
             context: call.context,
             request: MiddlewareRequest {
+                original_settings: head.settings.clone(),
                 body: call.payload,
                 original_body,
-                body_visible: head.body_visible,
                 body_replaced: false,
                 original_protocol,
                 original_headers,
@@ -339,4 +352,30 @@ impl MiddlewareCall {
 
 fn invalid_input() -> PluginFault {
     PluginFault::new(ErrorCode::InvalidInput, "middleware input is invalid")
+}
+
+/// 不同公开边界提供类型化视图，注册与组合仍使用同一个 middleware 函数。
+pub trait MiddlewareInput: Sized + Send + 'static {
+    type Output: MiddlewareOutput;
+    fn accepts(stage: Stage) -> bool;
+    fn decode(call: PluginCall) -> Result<Self, PluginFault>;
+}
+
+pub trait MiddlewareOutput: Send + 'static {
+    fn encode(self) -> Result<CallReply, PluginFault>;
+}
+
+impl MiddlewareInput for RequestCall {
+    type Output = MiddlewareResponse;
+    fn accepts(stage: Stage) -> bool {
+        matches!(stage, Stage::Request | Stage::Attempt)
+    }
+    fn decode(call: PluginCall) -> Result<Self, PluginFault> {
+        Self::try_from(call)
+    }
+}
+impl MiddlewareOutput for MiddlewareResponse {
+    fn encode(self) -> Result<CallReply, PluginFault> {
+        self.into_reply()
+    }
 }

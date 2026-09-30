@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{Contributions, Permission, Stage};
+use crate::{Contributions, Stage};
 
 /// 一次会话绑定不可变制品与配置；重启必须使用新的 incarnation。
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -13,7 +13,6 @@ pub struct Handshake {
     pub generation: u64,
     pub incarnation: String,
     pub configuration: serde_json::Value,
-    pub permissions: Vec<Permission>,
     #[serde(deserialize_with = "crate::capability::deserialize_contributions")]
     pub contributes: Contributions,
 }
@@ -41,6 +40,8 @@ pub struct CallContext {
     pub incarnation: String,
     pub stage: Stage,
     pub timeout_ms: u64,
+    /// 首个流式结果返回后由资源 owner 控制取消，不再沿用初始调用期限。
+    pub resource_stream: bool,
     pub resource_scope_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,

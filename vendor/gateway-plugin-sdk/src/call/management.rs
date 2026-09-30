@@ -20,7 +20,7 @@ pub struct ManagementRegistration {
     pub callbacks: Vec<ManagementCallback>,
 }
 
-/// 仅接受宿主签发的一次性 state；回调不能访问账号、网络或私有状态宿主端口。
+/// 公开登录回调；宿主签发的一次性 state 用于关联已发起的流程。
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagementCallback {
@@ -28,7 +28,7 @@ pub struct ManagementCallback {
     pub response_content_types: Vec<String>,
 }
 
-/// 管理 handler 默认且始终要求管理员身份；浏览器 Cookie、Authorization 不会传入插件。
+/// 管理 handler 默认要求管理员身份；原始请求头完整传入插件。
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagementRoute {
@@ -39,7 +39,7 @@ pub struct ManagementRoute {
     pub response_content_types: Vec<String>,
 }
 
-/// 资源必须已在包清单 resources 中声明并校验摘要，公开资源还须单独获得授权。
+/// 资源须在包清单 resources 中声明并校验摘要；`public` 决定是否允许未登录访问。
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagementResource {
@@ -68,14 +68,18 @@ pub struct ManagementRequest {
     pub path: String,
     pub query: String,
     pub content_type: Option<String>,
+    #[serde(default)]
+    pub headers: Vec<super::middleware::MiddlewareHeader>,
 }
 
-/// 原始响应体独立放在帧 payload；宿主拥有 CSP、安全头及大小限制。
+/// 原始响应体独立放在帧 payload；显式 headers 可覆盖宿主的默认响应头。
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagementResponse {
     pub status: u16,
     pub content_type: String,
+    #[serde(default)]
+    pub headers: Vec<super::middleware::MiddlewareHeader>,
 }
 
 /// `command_line.register` 的只读结果；注册和帮助查询不能执行命令或登录。

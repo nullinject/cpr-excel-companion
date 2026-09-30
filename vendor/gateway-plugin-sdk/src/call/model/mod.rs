@@ -2,10 +2,11 @@
 
 use serde::{Deserialize, Serialize};
 
-mod codec;
+pub(in crate::call) mod codec;
+pub mod facts;
 pub use codec::{ExecutionEncodingError, MAX_EXECUTION_PAYLOAD_BYTES};
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContentKind {
     Text,
@@ -15,7 +16,7 @@ pub enum ContentKind {
     Audio,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FinishReason {
     Stop,
@@ -25,7 +26,7 @@ pub enum FinishReason {
     Other,
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Usage {
     pub input_tokens: Option<u64>,
@@ -40,13 +41,16 @@ pub struct Usage {
 
 /// 每个流分块是一个完整封套；同一 wire 的事实必须合并，避免重复交付客户端。
 /// 载荷及私有状态不实现 Debug，且不能用拆分封套绕过宿主大小和序列检查。
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionEvent {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub facts: Vec<CanonicalEvent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wire: Option<WireEvent>,
+    /// 宿主确认的来源事实；回传快照不会触发计量、续接或发送状态更新。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<Box<facts::ExecutionFacts>>,
 }
 
 impl ExecutionEvent {
@@ -89,7 +93,7 @@ impl ExecutionEvent {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CanonicalEvent {
     Started {
@@ -124,14 +128,14 @@ pub enum CanonicalEvent {
     },
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WireEvent {
     pub protocol: String,
     pub payload: WirePayload,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WirePayload {
     Json {

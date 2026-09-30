@@ -1,13 +1,13 @@
 {
-  "manifestVersion": 1,
+  "manifestVersion": 2,
   "name": "excel-companion",
   "publisher": "nullinject",
   "displayName": "Excel Companion",
-  "version": "0.8.9",
+  "version": "0.9.0",
   "description": "Excel 通道适配插件。日常监控与路由设置请进入侧栏「Excel 网关」；此处只配置宿主连接。",
   "license": "Unlicense",
   "engines": {
-    "codex-proxy-rs": ">=3.16.0, <4.0.0"
+    "codex-proxy-rs": ">=3.18.2, <3.19.0"
   },
   "main": "bin/cpr-excel-companion-plugin",
   "runtime": "trustedProcess",
@@ -21,18 +21,12 @@
       ],
       "outputFormats": [
         "openai"
-      ]
+      ],
+      "version": 3
     },
     "management": {},
-    "request_lifecycle": {},
-    "usage": {}
+    "observer": {}
   },
-  "permissions": [
-    "requests",
-    "network",
-    "models",
-    "data"
-  ],
   "configurationSchema": {
     "type": "object",
     "properties": {

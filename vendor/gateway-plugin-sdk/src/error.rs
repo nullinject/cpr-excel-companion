@@ -33,6 +33,9 @@ pub struct PluginFault {
     pub send_state: SendState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_status: Option<u16>,
+    /// 原始边界错误详情；按合同完整传递，不作为诊断日志输出。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
 }
 
 impl std::fmt::Debug for PluginFault {
@@ -54,6 +57,7 @@ impl PluginFault {
             message: message.into(),
             send_state: SendState::NotSent,
             http_status: None,
+            details: None,
         }
     }
 }

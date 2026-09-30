@@ -10,10 +10,10 @@ use serde::{
 };
 use serde_json::Value;
 
-use crate::{Capability, Contributions, PROTOCOL_VERSION, Permission, Stage};
+use crate::{Capability, Contributions, PROTOCOL_VERSION, Stage};
 
 /// 当前插件清单格式版本。
-pub const MANIFEST_VERSION: u32 = 1;
+pub const MANIFEST_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -109,8 +109,6 @@ pub struct Manifest {
     pub runtime: RuntimeKind,
     #[serde(deserialize_with = "crate::capability::deserialize_contributions")]
     pub contributes: Contributions,
-    #[serde(default)]
-    pub permissions: BTreeSet<Permission>,
     #[serde(default = "empty_configuration_schema")]
     pub configuration_schema: serde_json::Value,
     #[serde(default)]
@@ -261,8 +259,9 @@ impl Manifest {
             let stages = declaration.stages.iter().copied().collect::<BTreeSet<_>>();
             let input_formats = declaration.input_formats.iter().collect::<BTreeSet<_>>();
             let output_formats = declaration.output_formats.iter().collect::<BTreeSet<_>>();
-            if !(declaration.version == 1
-                || (*capability == Capability::Middleware && declaration.version == 2))
+            if !capability
+                .contract_versions()
+                .contains(&declaration.version)
                 || declaration.id.len() > 128
                 || local_id.is_empty()
                 || !local_id.is_ascii()
@@ -270,7 +269,6 @@ impl Manifest {
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
                 || !contribution_ids.insert(&declaration.id)
-                || declaration.stages.len() > 32
                 || stages.len() != declaration.stages.len()
                 || input_formats.len() != declaration.input_formats.len()
                 || output_formats.len() != declaration.output_formats.len()
@@ -281,10 +279,16 @@ impl Manifest {
                     .any(|format| !platform_component(format))
                 || (*capability == Capability::Middleware
                     && (declaration.stages.is_empty()
-                        || declaration
-                            .stages
-                            .iter()
-                            .any(|stage| !matches!(stage, Stage::Request | Stage::Attempt))))
+                        || declaration.stages.iter().any(|stage| {
+                            !matches!(
+                                stage,
+                                Stage::Http
+                                    | Stage::WebSocket
+                                    | Stage::Service
+                                    | Stage::Request
+                                    | Stage::Attempt
+                            )
+                        })))
                 || (*capability != Capability::Middleware
                     && declaration.stages != capability.fixed_stages())
             {

@@ -174,7 +174,7 @@ pub enum ModelOperation {
 
 /// 模型执行回调的请求元数据；正文始终使用 RPC 的独立二进制载荷。
 ///
-/// Provider/账号是进一步收窄，不是绕过父请求 Key 范围的授权凭证。
+/// Provider/账号用于指定执行目标；显式 Key 决定本次模型执行身份。
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelExecuteRequest {
@@ -282,7 +282,7 @@ pub struct AffinityLookupResult {
     pub account_id: Option<String>,
 }
 
-/// 模型执行回调的有界事件批次。单个事件使用 GPE1 封套，批次只增加
+/// 模型执行回调的有界事件批次。单个事件使用 GPE2 封套，批次只增加
 /// 长度索引，不把原生正文改写成 JSON/base64。
 #[derive(Clone, Default)]
 pub struct ModelEventBatch {

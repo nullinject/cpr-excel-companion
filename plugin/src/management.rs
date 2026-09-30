@@ -59,6 +59,7 @@ fn reply(status: u16, payload: Vec<u8>) -> TypedReply<ManagementResponse> {
     TypedReply::new(ManagementResponse {
         status,
         content_type: "application/json".into(),
+        headers: vec![],
     })
     .with_payload(payload)
 }

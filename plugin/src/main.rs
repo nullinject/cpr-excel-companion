@@ -7,7 +7,7 @@ mod observation;
 use cpr_excel_companion::auth::{Context, sign};
 use gateway_plugin_sdk::{
     ErrorCode, PluginFault,
-    client::{PluginBuilder, PluginSession, SessionConfig},
+    client::{PluginBuilder, PluginSession, RequestCall, SessionConfig},
 };
 use serde_json::Value;
 use std::{
@@ -53,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "routingMode": "host_binding",
     }));
     let plugin = PluginBuilder::from_json(include_bytes!("../plugin.json"))?
-        .middleware(move |mut call| {
+        .middleware(move |mut call: RequestCall| {
             let secret = secret.clone();
             let scope = scope.clone();
             async move {
@@ -61,10 +61,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     PluginFault::new(ErrorCode::InvalidInput, "attempt has no selected account")
                 })?;
                 // 连接池会复用握手头；逐条消息必须带本次 attempt 的签名上下文。
-                let mut body: Value = serde_json::from_slice(&call.request.body)
-                    .map_err(|_| {
-                        PluginFault::new(ErrorCode::InvalidInput, "bridge requires a JSON body")
-                    })?;
+                let mut body: Value = serde_json::from_slice(&call.request.body).map_err(|_| {
+                    PluginFault::new(ErrorCode::InvalidInput, "bridge requires a JSON body")
+                })?;
                 let object = body.as_object_mut().ok_or_else(|| {
                     PluginFault::new(ErrorCode::InvalidInput, "bridge requires an object body")
                 })?;
@@ -109,14 +108,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 call.next.run(call.request).await
             }
         })?
-        .on(
-            gateway_plugin_sdk::client::methods::OBSERVE_REQUEST,
-            move |call| {
-                let secret = observe_secret.clone();
-                let url = observe_url.clone();
-                async move { observation::forward(call, &url, &secret).await }
-            },
-        )?
+        .on(gateway_plugin_sdk::client::methods::OBSERVE, move |call| {
+            let secret = observe_secret.clone();
+            let url = observe_url.clone();
+            async move { observation::forward(call, &url, &secret).await }
+        })?
         .management(management::registration(show_page), move |call| {
             let secret = control_secret.clone();
             let url = control_url.clone();
@@ -142,7 +138,7 @@ mod tests {
     }
 
     #[test]
-    fn official_316_manifest_avoids_request_websocket_framing_bug() {
+    fn bridge_adapter_keeps_attempt_stage() {
         let value: serde_json::Value =
             serde_json::from_slice(include_bytes!("../plugin.json")).unwrap();
         assert_eq!(

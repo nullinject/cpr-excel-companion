@@ -17,7 +17,7 @@ use crate::{
     },
 };
 
-use super::{CallFuture, CallReply, MiddlewareCall, MiddlewareResponse, PluginCall, PluginHandler};
+use super::{CallFuture, CallReply, MiddlewareInput, MiddlewareOutput, PluginCall, PluginHandler};
 
 pub use typed::{Empty, Method, TypedCall, TypedReply};
 
@@ -110,16 +110,20 @@ impl PluginBuilder {
     /// # Errors
     ///
     /// 未声明中间件或重复注册时失败。
-    pub fn middleware<F, Fut>(mut self, handler: F) -> Result<Self, AuthorError>
+    pub fn middleware<C, F, Fut>(mut self, handler: F) -> Result<Self, AuthorError>
     where
-        F: Fn(MiddlewareCall) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<MiddlewareResponse, PluginFault>> + Send + 'static,
+        C: MiddlewareInput,
+        F: Fn(C) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<C::Output, PluginFault>> + Send + 'static,
     {
         let declaration = self
             .manifest
             .contributes
             .get(&Capability::Middleware)
             .ok_or(AuthorError::Method(crate::call::middleware::HANDLE_METHOD))?;
+        if declaration.stages.iter().any(|stage| !C::accepts(*stage)) {
+            return Err(AuthorError::Method(crate::call::middleware::HANDLE_METHOD));
+        }
         let stages = declaration.stages.clone();
         let handler = Arc::new(handler);
         self.insert(
@@ -131,7 +135,7 @@ impl PluginBuilder {
                     if !allowed {
                         return Err(typed::invalid_input());
                     }
-                    handler(MiddlewareCall::try_from(call)?).await?.into_reply()
+                    handler(C::decode(call)?).await?.encode()
                 })
             }),
         )?;
