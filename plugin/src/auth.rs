@@ -20,8 +20,7 @@ use uuid::Uuid;
 const DYNAMIC_CLIENT_ID: &str = "dynamic_agent_client";
 const AUTHORIZE_URL: &str = "https://auth.openai.com/api/accounts/authorize";
 const TOKEN_URL: &str = "https://auth.openai.com/api/accounts/oauth/token";
-/// BPS 的访问执行按 token 受众匹配；受众必须是 bps.openai.com 才会命中规则。
-const RESOURCE: &str = "https://bps.openai.com";
+const RESOURCE: &str = "https://api.openai.com/v1";
 /// Excel 加载项等第三方应用使用的 loopback 回调。
 pub const REDIRECT_URI: &str = "http://127.0.0.1:1455/auth/callback";
 /// `chatgpt.tokens.use.direct` 是直接调用权限，缺它即无法代表用户发起推理。
@@ -47,6 +46,9 @@ pub struct Session {
     pub openai_user_id: String,
     #[serde(default)]
     pub scopes: Vec<String>,
+    /// 会话来源：`siwc` 为本插件登录，`excel-addin` 为从 Excel 加载项缓存导入
+    #[serde(default)]
+    pub source: String,
     /// Unix 秒；0 表示上游未返回有效期
     #[serde(default)]
     pub expires_at: u64,
@@ -316,6 +318,7 @@ impl Auth {
             openai_account_id: claim(&claims, "chatgpt_account_id"),
             openai_user_id: claim(&claims, "chatgpt_account_user_id"),
             scopes,
+            source: "siwc".to_owned(),
             expires_at,
         };
         let mut store = self
@@ -338,16 +341,13 @@ impl Auth {
             .accounts
             .values()
             .map(|session| {
-                let direct = session
-                    .scopes
-                    .iter()
-                    .any(|scope| scope == "chatgpt.tokens.use.direct");
                 json!({
                     "accountId": session.account_id,
                     "expiresAt": session.expires_at,
-                    "expired": !direct || (session.expires_at != 0 && session.expires_at <= now()),
+                    "expired": !usable(session) || (session.expires_at != 0 && session.expires_at <= now()),
                     "openaiAccountId": session.openai_account_id,
                     "scopes": session.scopes,
+                    "source": session.source,
                 })
             })
             .collect();
@@ -374,11 +374,7 @@ impl Auth {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let session = store.accounts.get(account_id)?;
-        if !session
-            .scopes
-            .iter()
-            .any(|scope| scope == "chatgpt.tokens.use.direct")
-        {
+        if !usable(session) {
             return None;
         }
         if session.expires_at != 0 && session.expires_at <= now() {
@@ -386,6 +382,15 @@ impl Auth {
         }
         Some(session.clone())
     }
+}
+
+/// 可直接用于 Excel 通道的会话：SIWC 需带 direct 权限，加载项导入的会话本身即 BPS 受众。
+fn usable(session: &Session) -> bool {
+    session.source == "excel-addin"
+        || session
+            .scopes
+            .iter()
+            .any(|scope| scope == "chatgpt.tokens.use.direct")
 }
 
 fn url_encode(value: &str) -> String {

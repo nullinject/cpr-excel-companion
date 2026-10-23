@@ -1,5 +1,7 @@
-## 1.0.0-rc.9 · 2026-10-23
+## 1.0.0-rc.10 · 2026-10-23
 
+- 还原 SIWC 的 `resource` 为 `https://api.openai.com/v1`：`https://bps.openai.com` 被授权端判定为 invalid_authorize_request。
+- 会话新增 `source` 字段；`excel-addin` 来源（从 Excel 加载项缓存导入）无需 direct 权限即可用于 Excel 通道。
 - SIWC 的 `resource` 改为 `https://bps.openai.com`：BPS 的访问执行按 token 受众匹配，
   之前用 `https://api.openai.com/v1` 签发，BPS 直接返回 `no_matching_rule`。
 - **改用 Excel 加载项同款授权（SIWC）**：授权端点改为 `auth.openai.com/api/accounts/authorize`，
@@ -27,7 +29,7 @@
 - 工具链固定 Rust 1.99.1，`Atomic::fetch_update` 改用 `try_update`；SDK 内置测试随上游同步。
 - 兼容性测试改为覆盖 3.29.7 起的宿主序列，并断言三项能力版本。
 
-升级说明：宿主须为 v3.29.7 或更高；v3.18.x 宿主请继续使用 1.0.0-rc.1。早先按 3.18.2 SDK 构建、版本号同为 1.0.0-rc.2 的制品与本版内容不同，宿主禁止同版本替换，因此本版改用 1.0.0-rc.9。切换插件代次会使已有续接材料失效，客户端需重发完整历史。
+升级说明：宿主须为 v3.29.7 或更高；v3.18.x 宿主请继续使用 1.0.0-rc.1。早先按 3.18.2 SDK 构建、版本号同为 1.0.0-rc.2 的制品与本版内容不同，宿主禁止同版本替换，因此本版改用 1.0.0-rc.10。切换插件代次会使已有续接材料失效，客户端需重发完整历史。
 
 ## 1.0.0-rc.1 · 2026-09-30
 
