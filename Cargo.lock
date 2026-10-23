@@ -170,7 +170,7 @@ dependencies = [
 
 [[package]]
 name = "cpr-excel-companion"
-version = "1.0.0-rc.3"
+version = "1.0.0-rc.4"
 dependencies = [
  "async-stream",
  "axum",
@@ -192,15 +192,18 @@ dependencies = [
 
 [[package]]
 name = "cpr-excel-companion-plugin"
-version = "1.0.0-rc.3"
+version = "1.0.0-rc.4"
 dependencies = [
  "async-stream",
+ "base64 0.23.1",
  "cpr-excel-companion",
  "futures-util",
  "gateway-plugin-sdk",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

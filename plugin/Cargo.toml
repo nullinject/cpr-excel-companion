@@ -1,6 +1,6 @@
 [package]
 name = "cpr-excel-companion-plugin"
-version = "1.0.0-rc.3"
+version = "1.0.0-rc.4"
 edition = "2024"
 license = "Unlicense"
 publish = false
@@ -12,3 +12,6 @@ serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt", "io-std", "net", "time"] }
 futures-util = "0.3"
 async-stream = "0.3"
+base64 = "0.23"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }

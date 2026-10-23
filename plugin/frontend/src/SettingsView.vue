@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import type { Account, ClientKey, PluginInfo, Policy } from './gateway'
-import { Check, RefreshCw, Search } from '@lucide/vue'
-import { computed, ref } from 'vue'
+import { Check, KeyRound, RefreshCw, Search } from '@lucide/vue'
+import { computed, onMounted, ref } from 'vue'
+import { api } from './api'
 import { accountAllowed, setAccountAllowed, setChannel } from './gateway'
 import RoutingSettings from './RoutingSettings.vue'
 
@@ -25,6 +26,94 @@ const emit = defineEmits<{ save: [], discard: [], reloadCatalogs: [] }>()
 const policy = defineModel<Policy>('policy', { required: true })
 const accountSearch = ref('')
 const section = ref('routing')
+// 账户级 Excel 授权：按账户 ID 保存，未授权时继续使用宿主注入的凭据。
+interface AuthEntry {
+  accountId: string
+  expiresAt: number
+  expired: boolean
+}
+const authEntries = ref(new Map<string, AuthEntry>())
+const authBusy = ref('')
+const authError = ref('')
+const authDialog = ref<{ accountId: string, state: string, url: string } | null>(null)
+const authCallback = ref('')
+
+async function loadAuthStatus() {
+  try {
+    const status = await api<{ accounts: AuthEntry[] }>('api/auth/status')
+    authEntries.value = new Map(status.accounts.map(entry => [entry.accountId, entry]))
+  }
+  catch (error) {
+    authError.value = error instanceof Error ? error.message : '无法读取授权状态'
+  }
+}
+
+async function startAuth(accountId: string) {
+  authBusy.value = accountId
+  authError.value = ''
+  try {
+    const started = await api<{ state: string, url: string }>('api/auth/start', {
+      account_id: accountId,
+    })
+    authDialog.value = { accountId, state: started.state, url: started.url }
+    authCallback.value = ''
+    window.open(started.url, '_blank', 'noopener')
+  }
+  catch (error) {
+    authError.value = error instanceof Error ? error.message : '无法开始授权'
+  }
+  finally {
+    authBusy.value = ''
+  }
+}
+
+async function completeAuth() {
+  const dialog = authDialog.value
+  if (!dialog) {
+    return
+  }
+  authBusy.value = dialog.accountId
+  authError.value = ''
+  try {
+    await api('api/auth/complete', {
+      state: dialog.state,
+      callback: authCallback.value.trim(),
+    })
+    authDialog.value = null
+    await loadAuthStatus()
+  }
+  catch (error) {
+    authError.value = error instanceof Error ? error.message : '回调处理失败'
+  }
+  finally {
+    authBusy.value = ''
+  }
+}
+
+async function revokeAuth(accountId: string) {
+  authBusy.value = accountId
+  authError.value = ''
+  try {
+    await api('api/auth/logout', { account_id: accountId })
+    await loadAuthStatus()
+  }
+  catch (error) {
+    authError.value = error instanceof Error ? error.message : '解除授权失败'
+  }
+  finally {
+    authBusy.value = ''
+  }
+}
+
+function authLabel(accountId: string) {
+  const entry = authEntries.value.get(accountId)
+  if (!entry) {
+    return '未授权'
+  }
+  return entry.expired ? '已过期' : '已授权'
+}
+
+onMounted(loadAuthStatus)
 const policyErrorsAsServerError = computed({
   get: () => policy.value.policy_errors_as_server_error ?? false,
   set: (value: boolean) => { policy.value.policy_errors_as_server_error = value },
@@ -281,6 +370,27 @@ const selectedCount = computed(
                         : "已停用"
                   }}
                 </span>
+                <button
+                  type="button"
+                  class="gw-auth-button"
+                  :class="{ 'is-authorized': authEntries.get(account.account_id) && !authEntries.get(account.account_id)?.expired }"
+                  :disabled="authBusy === account.account_id"
+                  :title="`Excel 通道授权：${authLabel(account.account_id)}`"
+                  @click.prevent.stop="startAuth(account.account_id)"
+                >
+                  <KeyRound :size="14" />
+                  {{ authLabel(account.account_id) }}
+                </button>
+                <button
+                  v-if="authEntries.get(account.account_id)"
+                  type="button"
+                  class="gw-auth-button is-ghost"
+                  :disabled="authBusy === account.account_id"
+                  title="解除该账户的 Excel 授权"
+                  @click.prevent.stop="revokeAuth(account.account_id)"
+                >
+                  解除
+                </button>
               </label>
               <div v-if="!accountList.length" class="gw-empty">
                 <p>
@@ -292,6 +402,30 @@ const selectedCount = computed(
                         : "暂无 OpenAI 账户"
                   }}
                 </p>
+              </div>
+            </div>
+            <p v-if="authError" class="gw-auth-error">
+              {{ authError }}
+            </p>
+            <div v-if="authDialog" class="gw-auth-dialog" role="dialog" aria-label="完成 Excel 授权">
+              <p>
+                已在新标签页打开授权页。登录完成后浏览器会跳到
+                <code>127.0.0.1:1455</code>（打不开是正常的），把地址栏完整地址粘贴到这里。
+              </p>
+              <input
+                v-model="authCallback"
+                type="text"
+                placeholder="http://127.0.0.1:1455/auth/callback?code=…&state=…"
+                autocomplete="off"
+                spellcheck="false"
+              >
+              <div class="gw-auth-actions">
+                <button type="button" :disabled="authBusy === authDialog.accountId" @click="completeAuth">
+                  完成授权
+                </button>
+                <button type="button" class="is-ghost" @click="authDialog = null">
+                  取消
+                </button>
               </div>
             </div>
             <p class="gw-route-note">

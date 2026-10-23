@@ -644,3 +644,74 @@
     align-self: flex-end;
   }
 }
+
+/* 账户级 Excel 授权 */
+.gw-auth-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border: 1px solid var(--gw-line);
+  border-radius: 999px;
+  background: var(--gw-soft);
+  color: var(--gw-muted);
+  font-size: 12px;
+  line-height: 18px;
+  cursor: pointer;
+}
+.gw-auth-button.is-authorized {
+  border-color: var(--gw-accent);
+  color: var(--gw-accent);
+}
+.gw-auth-button.is-ghost {
+  background: transparent;
+}
+.gw-auth-button:disabled {
+  opacity: 0.55;
+  cursor: progress;
+}
+.gw-auth-error {
+  margin: 8px 0 0;
+  color: #e5484d;
+  font-size: 12px;
+}
+.gw-auth-dialog {
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid var(--gw-line);
+  border-radius: 10px;
+  background: var(--gw-soft);
+}
+.gw-auth-dialog p {
+  margin: 0 0 8px;
+  color: var(--gw-muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.gw-auth-dialog input {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid var(--gw-line);
+  border-radius: 8px;
+  background: var(--gw-bg);
+  color: inherit;
+  font-size: 12px;
+}
+.gw-auth-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+.gw-auth-actions button {
+  padding: 4px 12px;
+  border: 1px solid var(--gw-line);
+  border-radius: 8px;
+  background: var(--gw-bg);
+  color: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.gw-auth-actions button.is-ghost {
+  background: transparent;
+  color: var(--gw-muted);
+}

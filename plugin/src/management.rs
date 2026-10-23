@@ -26,6 +26,7 @@ pub async fn handle(
     call: TypedCall<ManagementRequest>,
     control: &Control,
     plugin_info: &serde_json::Value,
+    auth: &crate::auth::Auth,
 ) -> Result<TypedReply<ManagementResponse>, PluginFault> {
     if !call.request.query.is_empty() || call.payload.len() > 65536 {
         return Ok(reply(400, br#"{"error":"invalid request"}"#.to_vec()));
@@ -105,6 +106,68 @@ pub async fn handle(
                     serde_json::to_vec(&value).map_err(|_| fault("policy encoding failed"))?,
                 ),
                 Err((status, error)) => json_error(status, error),
+            })
+        }
+        ("GET", "api/auth/status") if call.payload.is_empty() => Ok(reply(
+            200,
+            serde_json::to_vec(&auth.status()).map_err(|_| fault("auth status encoding failed"))?,
+        )),
+        ("POST", "api/auth/start") => {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Start {
+                account_id: String,
+            }
+            let Ok(value) = serde_json::from_slice::<Start>(&call.payload) else {
+                return Ok(json_error(400, "invalid authorization request"));
+            };
+            Ok(match auth.start(&value.account_id) {
+                Ok(value) => reply(
+                    200,
+                    serde_json::to_vec(&value)
+                        .map_err(|_| fault("authorization encoding failed"))?,
+                ),
+                Err(_) => json_error(400, "invalid account id"),
+            })
+        }
+        ("POST", "api/auth/complete") => {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Complete {
+                state: String,
+                callback: String,
+            }
+            let Ok(value) = serde_json::from_slice::<Complete>(&call.payload) else {
+                return Ok(json_error(400, "invalid callback request"));
+            };
+            match auth
+                .complete(&call.host, &value.state, &value.callback)
+                .await
+            {
+                Ok(session) => Ok(reply(
+                    200,
+                    serde_json::to_vec(&json!({
+                        "accountId": session.account_id,
+                        "expiresAt": session.expires_at,
+                        "openaiAccountId": session.openai_account_id,
+                    }))
+                    .map_err(|_| fault("authorization encoding failed"))?,
+                )),
+                Err(error) => Ok(json_error(400, &error.message)),
+            }
+        }
+        ("POST", "api/auth/logout") => {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Logout {
+                account_id: String,
+            }
+            let Ok(value) = serde_json::from_slice::<Logout>(&call.payload) else {
+                return Ok(json_error(400, "invalid logout request"));
+            };
+            Ok(match auth.logout(&value.account_id) {
+                Ok(()) => reply(200, br#"{"ok":true}"#.to_vec()),
+                Err(_) => json_error(500, "authorization file is not writable"),
             })
         }
         _ => Ok(json_error(404, "not found")),
@@ -209,6 +272,30 @@ pub fn registration(show_page: bool) -> ManagementRegistration {
             ManagementRoute {
                 method: "POST".into(),
                 path: "api/policy".into(),
+                request_content_types: vec!["application/json".into()],
+                response_content_types: vec!["application/json".into()],
+            },
+            ManagementRoute {
+                method: "GET".into(),
+                path: "api/auth/status".into(),
+                request_content_types: vec![],
+                response_content_types: vec!["application/json".into()],
+            },
+            ManagementRoute {
+                method: "POST".into(),
+                path: "api/auth/start".into(),
+                request_content_types: vec!["application/json".into()],
+                response_content_types: vec!["application/json".into()],
+            },
+            ManagementRoute {
+                method: "POST".into(),
+                path: "api/auth/complete".into(),
+                request_content_types: vec!["application/json".into()],
+                response_content_types: vec!["application/json".into()],
+            },
+            ManagementRoute {
+                method: "POST".into(),
+                path: "api/auth/logout".into(),
                 request_content_types: vec!["application/json".into()],
                 response_content_types: vec!["application/json".into()],
             },

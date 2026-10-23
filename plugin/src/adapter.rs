@@ -81,6 +81,36 @@ fn headers(excel: bool, request: &UpstreamAdapterRequest) -> Vec<(String, Vec<u8
     }
     headers
 }
+/// 用账户级授权会话覆盖宿主注入的凭据；同名头以插件显式值为准。
+fn apply_session(headers: &mut Vec<(String, Vec<u8>)>, session: &crate::auth::Session) {
+    const OVERRIDDEN: &[&str] = &[
+        "authorization",
+        "chatgpt-account-id",
+        "x-openai-account-id",
+        "x-openai-account-user-id",
+    ];
+    headers.retain(|(name, _)| !OVERRIDDEN.contains(&name.to_ascii_lowercase().as_str()));
+    headers.push((
+        "authorization".into(),
+        format!("Bearer {}", session.access_token).into_bytes(),
+    ));
+    if !session.openai_account_id.is_empty() {
+        headers.push((
+            "chatgpt-account-id".into(),
+            session.openai_account_id.clone().into_bytes(),
+        ));
+        headers.push((
+            "x-openai-account-id".into(),
+            session.openai_account_id.clone().into_bytes(),
+        ));
+    }
+    if !session.openai_user_id.is_empty() {
+        headers.push((
+            "x-openai-account-user-id".into(),
+            session.openai_user_id.clone().into_bytes(),
+        ));
+    }
+}
 const EXCEL_HEADERS: &[(&str, &str)] = &[
     ("user-agent", "Mozilla/5.0"),
     ("x-basispoints-auth-mode", "chatgpt"),
@@ -156,6 +186,7 @@ fn decode_request(payload: &[u8]) -> Result<Value, PluginFault> {
 pub async fn execute(
     call: TypedCall<UpstreamAdapterRequest>,
     control: Arc<Control>,
+    auth: Arc<crate::auth::Auth>,
 ) -> Result<TypedReply<Empty>, PluginFault> {
     // Pull ownership ties cancellation/backpressure to the request, with no detached producer.
     let stream = async_stream::try_stream! {
@@ -190,7 +221,13 @@ pub async fn execute(
         object.remove("type");
         object.insert("model".into(), json!(model.strip_suffix(crate::EXCEL_SUFFIX).filter(|m| !m.is_empty()).unwrap_or(&model)));
         object.insert("stream".into(), json!(true));
-        let headers = headers(lease.excel, &call.request);
+        let mut headers = headers(lease.excel, &call.request);
+        // 账户已单独授权时用该会话覆盖宿主注入的凭据；未授权账户保持原行为。
+        if lease.excel
+            && let Some(session) = auth.session_for(&call.request.account_id)
+        {
+            apply_session(&mut headers, &session);
+        }
         let input;
         let tools;
         let body;

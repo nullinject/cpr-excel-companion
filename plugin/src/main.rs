@@ -1,5 +1,6 @@
 //! CPR owns account selection, credentials, proxies and billing.
 mod adapter;
+mod auth;
 mod management;
 mod observation;
 mod wire;
@@ -26,8 +27,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !path.is_absolute() {
         return Err("policyFile must be absolute".into());
     }
-    let control = Arc::new(Control::load(path)?);
+    let control = Arc::new(Control::load(path.clone())?);
+    // 账户级 Excel 授权与会话状态；缺省文件不存在时视为全部未授权。
+    let auth = Arc::new(auth::Auth::load(
+        path.parent()
+            .ok_or("policyFile needs a parent directory")?
+            .join("account-auth.json"),
+    )?);
     let execute_control = control.clone();
+    let execute_auth = auth.clone();
     let observe_control = control.clone();
     let show_page = config["showPage"].as_bool().unwrap_or(true);
     let info = Arc::new(serde_json::json!({
@@ -40,7 +48,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?
         .on(methods::UPSTREAM_ADAPTER_EXECUTE, move |call| {
             let control = execute_control.clone();
-            async move { adapter::execute(call, control).await }
+            let auth = execute_auth.clone();
+            async move { adapter::execute(call, control, auth).await }
         })?
         .on(methods::OBSERVE, move |call| {
             let control = observe_control.clone();
@@ -48,8 +57,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?
         .management(management::registration(show_page), move |call| {
             let control = control.clone();
+            let auth = auth.clone();
             let info = info.clone();
-            async move { management::handle(call, &control, &info).await }
+            async move { management::handle(call, &control, &info, &auth).await }
         })?
         .build()?;
     session.run(plugin).await?;
