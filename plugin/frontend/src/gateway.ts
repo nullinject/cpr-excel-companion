@@ -112,6 +112,8 @@ export interface Account {
   enabled: boolean
   provider_id?: string
   group_ids?: string[]
+  name?: string
+  email?: string
 }
 export interface PluginInfo {
   isolationScope: string

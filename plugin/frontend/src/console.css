@@ -645,30 +645,65 @@
   }
 }
 
-/* 账户级 Excel 授权 */
-.gw-auth-button {
+/* 账户行与 BPS 授权开关 */
+.gw-account-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.gw-account-row > .gw-account {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.gw-switch {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  padding: 2px 8px;
-  border: 1px solid var(--gw-line);
-  border-radius: 999px;
-  background: var(--gw-soft);
-  color: var(--gw-muted);
-  font-size: 12px;
-  line-height: 18px;
+  gap: 6px;
+  flex: 0 0 auto;
   cursor: pointer;
+  user-select: none;
 }
-.gw-auth-button.is-authorized {
-  border-color: var(--gw-accent);
+.gw-switch input {
+  position: absolute;
+  opacity: 0;
+  width: 1px;
+  height: 1px;
+}
+.gw-switch-track {
+  position: relative;
+  display: inline-block;
+  width: 34px;
+  height: 18px;
+  border-radius: 999px;
+  background: var(--gw-line);
+  transition: background 0.15s ease;
+}
+.gw-switch-track > span {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--gw-bg);
+  transition: transform 0.15s ease;
+}
+.gw-switch.is-on .gw-switch-track {
+  background: var(--gw-accent);
+}
+.gw-switch.is-on .gw-switch-track > span {
+  transform: translateX(16px);
+}
+.gw-switch-text {
+  font-size: 12px;
+  color: var(--gw-muted);
+  white-space: nowrap;
+}
+.gw-switch.is-on .gw-switch-text {
   color: var(--gw-accent);
 }
-.gw-auth-button.is-ghost {
-  background: transparent;
-}
-.gw-auth-button:disabled {
+.gw-switch input:disabled + .gw-switch-track {
   opacity: 0.55;
-  cursor: progress;
 }
 .gw-auth-error {
   margin: 8px 0 0;

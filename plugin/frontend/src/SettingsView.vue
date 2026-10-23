@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import type { Account, ClientKey, PluginInfo, Policy } from './gateway'
-import { Check, KeyRound, RefreshCw, Search } from '@lucide/vue'
+import { Check, RefreshCw, Search } from '@lucide/vue'
 import { computed, onMounted, ref } from 'vue'
 import { api } from './api'
 import { accountAllowed, setAccountAllowed, setChannel } from './gateway'
@@ -26,7 +26,7 @@ const emit = defineEmits<{ save: [], discard: [], reloadCatalogs: [] }>()
 const policy = defineModel<Policy>('policy', { required: true })
 const accountSearch = ref('')
 const section = ref('routing')
-// 账户级 Excel 授权：按账户 ID 保存，未授权时继续使用宿主注入的凭据。
+// 账户级 Excel(BPS) 授权：按账户 ID 保存；未授权时沿用宿主注入的凭据。
 interface AuthEntry {
   accountId: string
   expiresAt: number
@@ -35,7 +35,7 @@ interface AuthEntry {
 const authEntries = ref(new Map<string, AuthEntry>())
 const authBusy = ref('')
 const authError = ref('')
-const authDialog = ref<{ accountId: string, state: string, url: string } | null>(null)
+const authPending = ref<{ accountId: string, state: string, url: string } | null>(null)
 const authCallback = ref('')
 
 async function loadAuthStatus() {
@@ -43,24 +43,44 @@ async function loadAuthStatus() {
     const status = await api<{ accounts: AuthEntry[] }>('api/auth/status')
     authEntries.value = new Map(status.accounts.map(entry => [entry.accountId, entry]))
   }
-  catch (error) {
-    authError.value = error instanceof Error ? error.message : '无法读取授权状态'
+  catch {
+    authError.value = '无法读取授权状态'
   }
 }
 
-async function startAuth(accountId: string) {
-  authBusy.value = accountId
+function authorized(accountId: string) {
+  const entry = authEntries.value.get(accountId)
+  return Boolean(entry && !entry.expired)
+}
+
+async function toggleAuth(accountId: string, next: boolean) {
   authError.value = ''
+  if (!next) {
+    authBusy.value = accountId
+    try {
+      await api('api/auth/logout', { account_id: accountId })
+      authPending.value = null
+      await loadAuthStatus()
+    }
+    catch {
+      authError.value = '解除授权失败'
+    }
+    finally {
+      authBusy.value = ''
+    }
+    return
+  }
+  authBusy.value = accountId
   try {
     const started = await api<{ state: string, url: string }>('api/auth/start', {
       account_id: accountId,
     })
-    authDialog.value = { accountId, state: started.state, url: started.url }
+    authPending.value = { accountId, state: started.state, url: started.url }
     authCallback.value = ''
     window.open(started.url, '_blank', 'noopener')
   }
-  catch (error) {
-    authError.value = error instanceof Error ? error.message : '无法开始授权'
+  catch {
+    authError.value = '无法开始授权'
   }
   finally {
     authBusy.value = ''
@@ -68,18 +88,18 @@ async function startAuth(accountId: string) {
 }
 
 async function completeAuth() {
-  const dialog = authDialog.value
-  if (!dialog) {
+  const pending = authPending.value
+  if (!pending) {
     return
   }
-  authBusy.value = dialog.accountId
+  authBusy.value = pending.accountId
   authError.value = ''
   try {
     await api('api/auth/complete', {
-      state: dialog.state,
+      state: pending.state,
       callback: authCallback.value.trim(),
     })
-    authDialog.value = null
+    authPending.value = null
     await loadAuthStatus()
   }
   catch (error) {
@@ -90,30 +110,9 @@ async function completeAuth() {
   }
 }
 
-async function revokeAuth(accountId: string) {
-  authBusy.value = accountId
-  authError.value = ''
-  try {
-    await api('api/auth/logout', { account_id: accountId })
-    await loadAuthStatus()
-  }
-  catch (error) {
-    authError.value = error instanceof Error ? error.message : '解除授权失败'
-  }
-  finally {
-    authBusy.value = ''
-  }
+function accountTitle(account: { account_id: string, name?: string, email?: string }) {
+  return account.email || account.name || `${account.account_id.slice(0, 12)}…`
 }
-
-function authLabel(accountId: string) {
-  const entry = authEntries.value.get(accountId)
-  if (!entry) {
-    return '未授权'
-  }
-  return entry.expired ? '已过期' : '已授权'
-}
-
-onMounted(loadAuthStatus)
 const policyErrorsAsServerError = computed({
   get: () => policy.value.policy_errors_as_server_error ?? false,
   set: (value: boolean) => { policy.value.policy_errors_as_server_error = value },
@@ -158,6 +157,7 @@ const selectedCount = computed(
       accountAllowed(policy.value, account.account_id),
     ).length,
 )
+onMounted(loadAuthStatus)
 </script>
 
 <template>
@@ -331,67 +331,73 @@ const selectedCount = computed(
               </span>
             </div>
             <div class="gw-account-list">
-              <label
+              <div
                 v-for="account in accountList"
                 :key="account.account_id"
-                class="gw-account"
-                :for="`gw-account-${account.account_id}`"
+                class="gw-account-row"
               >
-                <input
-                  :id="`gw-account-${account.account_id}`"
-                  type="checkbox"
-                  :checked="accountAllowed(policy, account.account_id)"
-                  :aria-label="`允许账户 ${account.account_id}`"
-                  @change="
-                    setAccountAllowed(
-                      policy,
-                      account.account_id,
-                      ($event.target as HTMLInputElement).checked,
-                    )
-                  "
+                <label
+                  class="gw-account"
+                  :for="`gw-account-${account.account_id}`"
                 >
-                <span class="gw-account-label">
-                  <strong>{{ account.account_id }}</strong><small>
+                  <input
+                    :id="`gw-account-${account.account_id}`"
+                    type="checkbox"
+                    :checked="accountAllowed(policy, account.account_id)"
+                    :aria-label="`允许账户 ${accountTitle(account)}`"
+                    @change="
+                      setAccountAllowed(
+                        policy,
+                        account.account_id,
+                        ($event.target as HTMLInputElement).checked,
+                      )
+                    "
+                  >
+                  <span class="gw-account-label">
+                    <strong>{{ accountTitle(account) }}</strong><small>
+                      {{
+                        account.missing
+                          ? "规则中存在，目录中未找到"
+                          : account.group_ids?.length
+                            ? `分组：${account.group_ids.join("、")}`
+                            : "未绑定分组"
+                      }}
+                    </small>
+                  </span>
+                  <span class="gw-subtle">
                     {{
                       account.missing
-                        ? "规则中存在，目录中未找到"
-                        : account.group_ids?.length
-                          ? `分组：${account.group_ids.join("、")}`
-                          : "未绑定分组"
+                        ? "待核对"
+                        : account.enabled
+                          ? "已启用"
+                          : "已停用"
                     }}
-                  </small>
-                </span>
-                <span class="gw-subtle">
-                  {{
-                    account.missing
-                      ? "待核对"
-                      : account.enabled
-                        ? "已启用"
-                        : "已停用"
-                  }}
-                </span>
-                <button
-                  type="button"
-                  class="gw-auth-button"
-                  :class="{ 'is-authorized': authEntries.get(account.account_id) && !authEntries.get(account.account_id)?.expired }"
-                  :disabled="authBusy === account.account_id"
-                  :title="`Excel 通道授权：${authLabel(account.account_id)}`"
-                  @click.prevent.stop="startAuth(account.account_id)"
+                  </span>
+                </label>
+                <label
+                  class="gw-switch"
+                  :class="{ 'is-on': authorized(account.account_id) }"
+                  :title="authorized(account.account_id) ? '关闭将解除该账户的 BPS 授权' : '开启后登录一次，授权该账户使用 BPS 通道'"
                 >
-                  <KeyRound :size="14" />
-                  {{ authLabel(account.account_id) }}
-                </button>
-                <button
-                  v-if="authEntries.get(account.account_id)"
-                  type="button"
-                  class="gw-auth-button is-ghost"
-                  :disabled="authBusy === account.account_id"
-                  title="解除该账户的 Excel 授权"
-                  @click.prevent.stop="revokeAuth(account.account_id)"
-                >
-                  解除
-                </button>
-              </label>
+                  <input
+                    type="checkbox"
+                    role="switch"
+                    :checked="authorized(account.account_id)"
+                    :disabled="authBusy === account.account_id"
+                    :aria-label="`授权 ${accountTitle(account)} 使用 BPS 通道`"
+                    @change="
+                      toggleAuth(
+                        account.account_id,
+                        ($event.target as HTMLInputElement).checked,
+                      )
+                    "
+                  >
+                  <span class="gw-switch-track" aria-hidden="true"><span /></span>
+                  <span class="gw-switch-text">
+                    {{ authorized(account.account_id) ? "BPS 已授权" : "BPS 未授权" }}
+                  </span>
+                </label>
+              </div>
               <div v-if="!accountList.length" class="gw-empty">
                 <p>
                   {{
@@ -407,10 +413,10 @@ const selectedCount = computed(
             <p v-if="authError" class="gw-auth-error">
               {{ authError }}
             </p>
-            <div v-if="authDialog" class="gw-auth-dialog" role="dialog" aria-label="完成 Excel 授权">
+            <div v-if="authPending" class="gw-auth-dialog" role="dialog" aria-label="完成 BPS 授权">
               <p>
-                已在新标签页打开授权页。登录完成后浏览器会跳到
-                <code>127.0.0.1:1455</code>（打不开是正常的），把地址栏完整地址粘贴到这里。
+                已打开授权页。登录后浏览器会跳到
+                <code>127.0.0.1:1455</code>（页面打不开是正常的），把地址栏完整地址粘到下面。
               </p>
               <input
                 v-model="authCallback"
@@ -420,10 +426,10 @@ const selectedCount = computed(
                 spellcheck="false"
               >
               <div class="gw-auth-actions">
-                <button type="button" :disabled="authBusy === authDialog.accountId" @click="completeAuth">
+                <button type="button" :disabled="authBusy === authPending.accountId" @click="completeAuth">
                   完成授权
                 </button>
-                <button type="button" class="is-ghost" @click="authDialog = null">
+                <button type="button" class="is-ghost" @click="authPending = null">
                   取消
                 </button>
               </div>
