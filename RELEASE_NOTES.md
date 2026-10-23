@@ -1,3 +1,17 @@
+## 1.0.0-rc.2 · 2026-10-23
+
+同步到 CPR 插件 SDK v3.29.7（提交 `78bc57c5cf24b01a38e985cdd739bb4ae89ce11f`）。此版本是发布候选，不是稳定 1.0。
+
+- 清单升级：`upstream_adapter` v1 → v4，`management` v1 → v2，`observer` v1 → v2；进程协议 v5，宿主范围收紧为 `>=3.29.7, <4.0.0`。
+- 适配 `UpstreamAdapterRequest.fast_mode` 三态，替换旧的 `disable_fast` 布尔语义；宿主冻结的 Fast 策略仍由宿主在 attempt 前应用，插件不二次改写。
+- 请求与响应头改用 `(String, Vec<u8>)` 字节形式，保留重复头与非 UTF-8 值；附件上传与受管 HTTP/WebSocket 出站同步调整。
+- `service_tier` 从事件顶层移入 `ResponseObservation`，同时上报请求 ID 与上游回显模型；原始观测与标准事实分离传递。
+- WebSocket 握手结果携带 `http_version` 与拒绝时的 trailers，匹配 v4 升级枚举。
+- 工具链固定 Rust 1.99.1，`Atomic::fetch_update` 改用 `try_update`；SDK 内置测试随上游同步。
+- 兼容性测试改为覆盖 3.29.7 起的宿主序列，并断言三项能力版本。
+
+升级说明：宿主须为 v3.29.7 或更高；v3.18.x 宿主请继续使用 1.0.0-rc.1。切换插件代次会使已有续接材料失效，客户端需重发完整历史。
+
 ## 1.0.0-rc.1 · 2026-09-30
 
 此版本是发布候选，不是稳定 1.0；未宣称解决宿主的长流截止时间问题。

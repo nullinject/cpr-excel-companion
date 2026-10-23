@@ -1,3 +1,5 @@
+//! 验证插件清单的默认值、路径安全、平台与能力版本约束
+
 use gateway_plugin_sdk::{
     Capability, ContributionDeclaration, Engines, Handshake, MANIFEST_VERSION, Manifest,
     ManifestError, PROTOCOL_VERSION, Package, PackageTarget, PluginIcon, PluginIconVariants, Stage,
@@ -21,7 +23,7 @@ fn source_manifest() -> Manifest {
         "contributes": {
             "middleware": {
                 "id": "9acme.request-tags.tagRequest",
-                "version": 3,
+                "version": 5,
                 "stages": ["request"],
                 "inputFormats": ["openai"],
                 "outputFormats": ["openai"]
@@ -94,8 +96,8 @@ fn author_manifest_fills_default_ids_versions_and_fixed_stages() {
         "main": "bin/worker",
         "runtime": "trustedProcess",
         "contributes": {
-            "middleware": {"version": 3, "stages": ["attempt"]},
-            "management": {}
+            "middleware": {"version": 5, "stages": ["attempt"]},
+            "management": {"version": 2}
         }
     });
     let manifest = Manifest::from_author_slice(&serde_json::to_vec(&source).unwrap()).unwrap();
@@ -103,10 +105,10 @@ fn author_manifest_fills_default_ids_versions_and_fixed_stages() {
     let management = &manifest.contributes[&Capability::Management];
 
     assert_eq!(middleware.id, "9acme.request-tags.middleware");
-    assert_eq!(middleware.version, 3);
+    assert_eq!(middleware.version, 5);
     assert_eq!(middleware.stages, [Stage::Attempt]);
     assert_eq!(management.id, "9acme.request-tags.management");
-    assert_eq!(management.version, 1);
+    assert_eq!(management.version, 2);
     assert_eq!(management.stages, [Stage::Management]);
 }
 
@@ -119,8 +121,10 @@ fn installation_checks_protocol_engine_and_target() {
         manifest.package_for(&host, "windows", "aarch64"),
         Err(ManifestError::Platform)
     );
-    manifest.package.as_mut().unwrap().protocol_version = PROTOCOL_VERSION + 1;
-    assert_eq!(manifest.validate(), Err(ManifestError::Incompatible));
+    for protocol_version in [PROTOCOL_VERSION - 1, PROTOCOL_VERSION + 1] {
+        manifest.package.as_mut().unwrap().protocol_version = protocol_version;
+        assert_eq!(manifest.validate(), Err(ManifestError::Incompatible));
+    }
     manifest.package.as_mut().unwrap().protocol_version = PROTOCOL_VERSION;
     manifest.engines.codex_proxy_rs = "*".parse().unwrap();
     assert_eq!(manifest.validate(), Err(ManifestError::Invalid));
@@ -128,29 +132,40 @@ fn installation_checks_protocol_engine_and_target() {
 
 #[test]
 fn capability_contract_versions_are_checked_independently_of_rpc_version() {
-    let mut manifest = packaged_manifest();
-    assert!(manifest.validate().is_ok());
-    for version in [0, 1, 2, 4, u32::MAX] {
-        manifest
-            .contributes
-            .get_mut(&Capability::Middleware)
-            .unwrap()
-            .version = version;
-        assert_eq!(manifest.validate(), Err(ManifestError::Invalid));
+    for (capability, stage, supported, needs_formats) in [
+        (Capability::Middleware, Stage::Request, 5, true),
+        (Capability::Management, Stage::Management, 2, false),
+        (Capability::UpstreamAdapter, Stage::Upstream, 4, true),
+        (Capability::Scheduler, Stage::Scheduling, 3, false),
+    ] {
+        for mut manifest in [source_manifest(), packaged_manifest()] {
+            let formats = if needs_formats {
+                vec!["openai".into()]
+            } else {
+                vec![]
+            };
+            manifest.contributes.clear();
+            manifest.contributes.insert(
+                capability,
+                ContributionDeclaration {
+                    id: "9acme.request-tags.contract".into(),
+                    version: supported,
+                    stages: vec![stage],
+                    input_formats: formats.clone(),
+                    output_formats: formats,
+                },
+            );
+            assert!(manifest.validate().is_ok(), "{capability:?} v{supported}");
+            for version in (0..supported).chain([supported + 1, u32::MAX]) {
+                manifest.contributes.get_mut(&capability).unwrap().version = version;
+                assert_eq!(
+                    manifest.validate(),
+                    Err(ManifestError::Invalid),
+                    "{capability:?} v{version}"
+                );
+            }
+        }
     }
-
-    manifest.contributes.clear();
-    manifest.contributes.insert(
-        Capability::Management,
-        ContributionDeclaration {
-            id: "9acme.request-tags.management".into(),
-            version: 2,
-            stages: vec![Stage::Management],
-            input_formats: vec![],
-            output_formats: vec![],
-        },
-    );
-    assert_eq!(manifest.validate(), Err(ManifestError::Invalid));
 }
 
 #[test]
@@ -344,24 +359,25 @@ fn state_namespaces_are_base_infrastructure_with_bounded_versions() {
 }
 
 #[test]
-fn public_manifest_fields_use_only_the_v3_camel_case_shape() {
-    let value = serde_json::to_value(source_manifest()).unwrap();
-    assert!(value.get("manifestVersion").is_some());
-    assert!(value.get("displayName").is_some());
-    assert!(value.get("configurationSchema").is_some());
-    assert!(value.get("schema_version").is_none());
+fn manifest_round_trips_public_fields_and_rejects_unknown_fields() {
+    let manifest = source_manifest();
+    let mut value = serde_json::to_value(&manifest).unwrap();
+    assert_eq!(value["manifestVersion"], MANIFEST_VERSION);
+    assert_eq!(value["displayName"], manifest.display_name);
+    assert_eq!(value["configurationSchema"], manifest.configuration_schema);
+    assert_eq!(
+        serde_json::from_value::<Manifest>(value.clone()).unwrap(),
+        manifest
+    );
 
-    let mut old = value;
-    old.as_object_mut()
-        .unwrap()
-        .insert("schema_version".into(), json!(3));
-    assert!(serde_json::from_value::<Manifest>(old).is_err());
+    value["unknownField"] = json!(true);
+    assert!(serde_json::from_value::<Manifest>(value).is_err());
 }
 
 #[test]
 fn contributes_rejects_duplicate_capability_keys_in_direct_json_parsing() {
     let declaration = r#"{
-        "id":"test.example.middleware","version":3,"stages":["request"],
+        "id":"test.example.middleware","version":5,"stages":["request"],
         "inputFormats":["openai"],"outputFormats":["openai"]
     }"#;
     let manifest = format!(
@@ -380,9 +396,8 @@ fn contributes_rejects_duplicate_capability_keys_in_direct_json_parsing() {
 
     let handshake = format!(
         r#"{{
-            "protocol_version":4,"artifact_sha256":"digest","plugin_id":"test.example",
+            "protocol_version":5,"artifact_sha256":"digest","plugin_id":"test.example",
             "instance_id":"instance","generation":1,"incarnation":"incarnation",
-            "configuration":{{}},
             "contributes":{{"middleware":{declaration},"middleware":{declaration}}}
         }}"#
     );
@@ -397,7 +412,7 @@ fn contributes_rejects_duplicate_capability_keys_in_direct_json_parsing() {
 fn contribution_declaration_uses_camel_case_description_fields() {
     let declaration = ContributionDeclaration {
         id: "test.example.middleware".into(),
-        version: 3,
+        version: 5,
         stages: vec![Stage::Request],
         input_formats: vec!["openai".into()],
         output_formats: vec!["openai".into()],
@@ -406,7 +421,7 @@ fn contribution_declaration_uses_camel_case_description_fields() {
         serde_json::to_value(declaration).unwrap(),
         json!({
             "id":"test.example.middleware",
-            "version":3,
+            "version":5,
             "stages":["request"],
             "inputFormats":["openai"],
             "outputFormats":["openai"]

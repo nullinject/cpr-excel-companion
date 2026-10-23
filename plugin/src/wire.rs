@@ -4,13 +4,15 @@ use gateway_plugin_sdk::{
     call::{
         model::{
             CanonicalEvent as Fact, ContentKind, ExecutionEvent, FinishReason, Usage, WireEvent,
-            WirePayload,
+            WirePayload, facts::ResponseObservation,
         },
         upstream_adapter::{UpstreamAdapterEvent, UpstreamFailure, UpstreamFailureKind},
     },
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
+/// 注册清单声明的传输类型；观测事件必须与之一致。
+const TRANSPORT: &str = "websocket";
 #[derive(Default)]
 pub struct Projection {
     started: bool,
@@ -218,7 +220,11 @@ impl Projection {
             }
         }
         frame.event.facts = facts;
-        frame.service_tier = response["service_tier"].as_str().map(str::to_owned);
+        let mut observation = ResponseObservation::new(TRANSPORT);
+        observation.service_tier = response["service_tier"].as_str().map(str::to_owned);
+        observation.request_id = response["id"].as_str().map(str::to_owned);
+        observation.upstream_response_model = model;
+        frame.observation = Some(observation);
         frame.event.wire = Some(WireEvent {
             protocol: "openai".into(),
             payload: WirePayload::Json {

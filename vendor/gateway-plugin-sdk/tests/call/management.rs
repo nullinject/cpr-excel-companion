@@ -1,3 +1,5 @@
+//! 验证插件管理与命令行合同的正文分离、类型及权限字段约束
+
 use gateway_plugin_sdk::call::management::{CommandRegistration, CommandResult, CommandValue};
 use serde_json::json;
 
@@ -18,12 +20,11 @@ fn management_contract_keeps_http_bodies_separate_and_rejects_authority_headers(
     let mut forged = request;
     forged["headers"] = json!({"Cookie":"must-not-cross-wire"});
     assert!(serde_json::from_value::<ManagementRequest>(forged).is_err());
-    assert!(
-        serde_json::from_value::<ManagementResponse>(
-            json!({"status":200,"content_type":"text/html","set_cookie":"forged"})
-        )
-        .is_err()
-    );
+    let response = serde_json::from_value::<ManagementResponse>(
+        json!({"status":200,"content_type":"text/html","set_cookie":"forged"}),
+    )
+    .unwrap();
+    assert!(response.headers.is_empty());
 }
 
 #[test]
@@ -56,14 +57,13 @@ fn command_values_preserve_types_and_portable_numeric_boundaries() {
         json!({"type":"int","value":2147483648_i64}),
         json!({"type":"duration","value":0.5}),
         json!({"type":"bool","value":"true"}),
-        json!({"type":"string","value":"test","authority":"admin"}),
     ] {
         assert!(serde_json::from_value::<CommandValue>(invalid).is_err());
     }
 }
 
 #[test]
-fn command_registration_and_result_reject_unknown_authority_fields() {
+fn command_registration_and_result_ignore_extra_fields_without_granting_authority() {
     let registration = json!({"commands":[{
         "name":"login", "description":"登录", "parameters":[{
             "name":"timeout", "description":"等待时长", "value_type":"duration",
@@ -74,9 +74,24 @@ fn command_registration_and_result_reject_unknown_authority_fields() {
     assert_eq!(value.commands[0].name, "login");
     let mut invalid = registration;
     invalid["commands"][0]["admin_id"] = json!("forged");
-    assert!(serde_json::from_value::<CommandRegistration>(invalid).is_err());
-    let result: CommandResult =
-        serde_json::from_value(json!({"stdout":"out\n","stderr":"err\n","exit_code":17})).unwrap();
+    assert_eq!(
+        serde_json::from_value::<CommandRegistration>(invalid)
+            .unwrap()
+            .commands[0]
+            .name,
+        "login"
+    );
+    assert!(
+        serde_json::from_value::<CommandValue>(
+            json!({"type":"string","value":"test","authority":"admin"})
+        )
+        .unwrap()
+            == CommandValue::String("test".into())
+    );
+    let result: CommandResult = serde_json::from_value(
+        json!({"stdout":"out\n","stderr":"err\n","exit_code":17,"admin_id":"ignored"}),
+    )
+    .unwrap();
     assert_eq!(result.exit_code, 17);
     assert!(result.accounts.is_empty());
     assert!(

@@ -1,3 +1,5 @@
+//! 验证观察事件保留已知事实、未知值与独立二进制载荷
+
 use gateway_plugin_sdk::{
     SendState,
     call::observation::{
@@ -201,12 +203,14 @@ fn cost_timings_and_failure_keep_unknown_facts_explicit_and_safe() {
 
     let timings = RequestTimings {
         first_text_ms: Some(12),
+        upstream_response_ms: Some(7_000),
+        upstream_engine_ms: Some(2.450638),
         latency_ms: Some(34),
         ..RequestTimings::default()
     };
     assert_eq!(
         serde_json::to_value(&timings).unwrap(),
-        json!({"first_text_ms":12,"latency_ms":34})
+        json!({"first_text_ms":12,"upstream_response_ms":7000,"upstream_engine_ms":2.450638,"latency_ms":34})
     );
 
     let failure = RequestFailure {

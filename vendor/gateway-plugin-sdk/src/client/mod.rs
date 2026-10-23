@@ -1,4 +1,4 @@
-//! 可选的插件侧异步传输与会话辅助；SDK 不启动网关服务。
+//! 可选的插件侧异步传输与会话辅助；SDK 不启动网关服务
 
 mod data;
 mod frame;
@@ -14,7 +14,7 @@ mod upstream_adapter;
 use crate::{ErrorCode, PluginFault};
 use serde::{Serialize, de::DeserializeOwned};
 
-pub use frame::{read_frame, validate_frame, write_frame};
+pub use frame::{EncodedFrame, read_frame, validate_frame, write_frame};
 pub use http::{HostHttpBody, HostHttpResponse};
 pub use middleware::{
     HttpBody, HttpCall, HttpFrame, HttpNext, HttpRequest, HttpResponse, MiddlewareBody,
@@ -28,9 +28,9 @@ pub use plugin::{
     AuthorError, ComposedPlugin, Empty, Method, PluginBuilder, TypedCall, TypedReply, methods,
 };
 pub use session::{
-    CallCancellation, CallFuture, CallReply, HostClient, HostReply, PluginCall, PluginHandler,
-    PluginSession, PullResponseFuture, PullResponseStream, ResponseStream, SessionConfig,
-    SessionError, StreamSender,
+    CallCancellation, CallDeadline, CallDeadlinePause, CallFuture, CallReply, HostClient,
+    HostReply, PluginCall, PluginHandler, PluginSession, PullResponseFuture, PullResponseStream,
+    ResponseStream, SessionConfig, SessionError, StreamSender,
 };
 pub use upstream_adapter::{UpstreamWebSocket, UpstreamWebSocketUpgrade};
 

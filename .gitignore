@@ -1,4 +1,5 @@
 /target/
+/target-linux/
 /dist/
 /private/
 **/node_modules/

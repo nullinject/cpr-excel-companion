@@ -1,10 +1,19 @@
-//! 宿主模型调用的流事件合同。
+//! 宿主模型调用的流事件合同
 
 use serde::{Deserialize, Serialize};
 
 pub(in crate::call) mod codec;
 pub mod facts;
 pub use codec::{ExecutionEncodingError, MAX_EXECUTION_PAYLOAD_BYTES};
+
+/// 内部请求允许 JSON 字符串转义与元数据开销，出站正文仍按原始配置上限检查
+#[must_use]
+pub fn request_payload_limit(body_bytes: usize) -> usize {
+    body_bytes
+        .saturating_mul(2)
+        .saturating_add(64 * 1024)
+        .min(u32::MAX as usize)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -39,8 +48,8 @@ pub struct Usage {
     pub total_tokens: Option<u64>,
 }
 
-/// 每个流分块是一个完整封套；同一 wire 的事实必须合并，避免重复交付客户端。
-/// 载荷及私有状态不实现 Debug，且不能用拆分封套绕过宿主大小和序列检查。
+/// 每个流分块是一个完整封套；同一 wire 的事实必须合并，避免重复交付客户端
+/// 载荷及私有状态不实现 Debug，且不能用拆分封套绕过宿主大小和序列检查
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionEvent {
@@ -48,24 +57,24 @@ pub struct ExecutionEvent {
     pub facts: Vec<CanonicalEvent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wire: Option<WireEvent>,
-    /// 宿主确认的来源事实；回传快照不会触发计量、续接或发送状态更新。
+    /// 宿主确认的来源事实；回传快照不会触发计量、续接或发送状态更新
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<Box<facts::ExecutionFacts>>,
 }
 
 impl ExecutionEvent {
-    /// 编码为带长度与版本的事件载荷；原始 wire/错误正文不经过 JSON 数组或 base64。
+    /// 编码为带长度与版本的事件载荷；原始 wire/错误正文不经过 JSON 数组或 base64
     ///
     /// # Errors
-    /// 总长度超过事件上限或元数据无法序列化时返回错误。
+    /// 总长度超过事件上限或元数据无法序列化时返回错误
     pub fn encode(self) -> Result<Vec<u8>, ExecutionEncodingError> {
         codec::encode_event(self)
     }
 
-    /// 从完整的执行流载荷解码，先验证各段长度再解析元数据。
+    /// 从完整的执行流载荷解码，先验证各段长度再解析元数据
     ///
     /// # Errors
-    /// 版本、长度、元数据或二进制段声明不一致时返回错误。
+    /// 版本、长度、元数据或二进制段声明不一致时返回错误
     pub fn decode(bytes: &[u8]) -> Result<Self, ExecutionEncodingError> {
         codec::decode_event(bytes)
     }
@@ -145,15 +154,21 @@ pub enum WirePayload {
         id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retry: Option<u64>,
-        /// 一个完整 SSE 帧的原字节；存在时必须与解析后的 data 和元数据一致。
+        /// 一个完整 SSE 帧的原字节；存在时必须与解析后的 data 和元数据一致
         #[serde(default, skip_serializing_if = "Option::is_none")]
         raw_sse: Option<Vec<u8>>,
     },
-    /// 注释、非 JSON data 等原生 SSE 表达，不能夹带第二个帧。
+    /// 完整 WebSocket 文本消息及可用的解析视图，原文独立放入二进制段
+    WebSocket {
+        event: Option<String>,
+        data: Option<serde_json::Value>,
+        message: Vec<u8>,
+    },
+    /// 注释、非 JSON data 等原生 SSE 表达，不能夹带第二个帧
     RawSse { frame: Vec<u8> },
-    /// 一个完整的非流式 JSON 响应正文，保留空白与字段顺序。
+    /// 一个完整的非流式 JSON 响应正文，保留空白与字段顺序
     RawJson { body: Vec<u8> },
-    /// 非流式 HTTP 响应正文的一个有序片段。
-    /// 客户端 adapter 必须同时限制单片与聚合后的总字节数。
+    /// 非流式 HTTP 响应正文的一个有序片段
+    /// 客户端 adapter 必须同时限制单片与聚合后的总字节数
     RawBody { body: Vec<u8> },
 }

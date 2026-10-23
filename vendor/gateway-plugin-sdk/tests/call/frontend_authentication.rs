@@ -1,16 +1,23 @@
+//! 验证插件认证合同限制身份选择并脱敏凭据和主体
+
 use gateway_plugin_sdk::call::frontend_authentication::{
     FrontendAuthenticationRequest, FrontendAuthenticationResult,
 };
 use serde_json::json;
 
 #[test]
-fn authentication_contract_never_accepts_a_plugin_selected_client_key() {
+fn authentication_result_only_consumes_the_principal_and_ignores_extra_fields() {
     let result = serde_json::from_value::<FrontendAuthenticationResult>(json!({
         "outcome":"authenticated",
         "principal":"controlled-principal",
         "client_key_id":"attacker-selected-key"
     }));
-    assert!(result.is_err());
+    assert_eq!(
+        result.unwrap(),
+        FrontendAuthenticationResult::Authenticated {
+            principal: "controlled-principal".into(),
+        }
+    );
 }
 
 #[test]

@@ -1,3 +1,5 @@
+//! 验证类型化插件处理器的组合注册、分派与能力声明一致性
+
 use std::{
     collections::BTreeMap,
     sync::{
@@ -76,7 +78,7 @@ fn command_registration() -> CommandRegistration {
 async fn composed_plugin_registers_and_dispatches_multiple_typed_entries() {
     let source = author_manifest(
         json!({
-            "management": {},
+            "management": {"version":2},
             "command_line": {},
         }),
         json!([]),
@@ -211,7 +213,10 @@ async fn catalog_and_retry_entries_use_typed_registration_and_stage_validation()
         catalog::{ModelAlias, ModelCatalogRegistration},
         policy::{RetryAction, RetryDecision, RetryDecisionRequest},
     };
-    let source = author_manifest(json!({"model_catalog":{},"retry_policy":{}}), json!([]));
+    let source = author_manifest(
+        json!({"model_catalog":{},"retry_policy":{"version":2}}),
+        json!([]),
+    );
     let manifest = gateway_plugin_sdk::Manifest::from_author_slice(&source).unwrap();
     let contributions = manifest.contributes.clone();
     let catalog = ModelCatalogRegistration {
@@ -361,7 +366,7 @@ async fn typed_dispatch_rejects_wrong_stage_and_payload_shape_before_handler() {
 
 #[test]
 fn build_reports_missing_declared_handler() {
-    let source = author_manifest(json!({"management": {}}), json!([]));
+    let source = author_manifest(json!({"management": {"version":2}}), json!([]));
     let result = PluginBuilder::from_json(&source).unwrap().build();
     assert!(matches!(
         result,
@@ -488,6 +493,7 @@ async fn send_call(
                 id,
                 method: method.into(),
                 context: CallContext {
+                    request: None,
                     call_id: id,
                     instance_id: "test-instance".into(),
                     generation: 1,

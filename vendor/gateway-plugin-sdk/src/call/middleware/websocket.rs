@@ -1,4 +1,4 @@
-//! 双工消息使用二进制 payload 或惰性句柄，避免强制 JSON/UTF-8 解码。
+//! 双工消息使用二进制 payload 或惰性句柄，避免强制 JSON/UTF-8 解码
 use super::MiddlewareHeader;
 use serde::{Deserialize, Serialize};
 pub const SEND_METHOD: &str = "host.middleware.send";
@@ -9,7 +9,7 @@ pub enum Direction {
     Outgoing,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Kind {
     Text,
     Binary,
@@ -18,13 +18,12 @@ pub enum Kind {
     Close { code: Option<u16> },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Payload {
     Bytes,
     Handle { handle: String },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Message {
     pub kind: Kind,
     pub payload: Payload,

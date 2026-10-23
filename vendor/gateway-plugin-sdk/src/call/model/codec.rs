@@ -1,8 +1,10 @@
+//! 模型执行事件的元数据与原始载荷分离编码及有界解码
+
 use serde::{Serialize, de::DeserializeOwned};
 
 use super::{ExecutionEvent, WirePayload};
 
-/// 宿主与插件还会施加更低的帧、队列及可用信用上限。
+/// 宿主与插件还会施加更低的帧、队列及可用信用上限
 pub const MAX_EXECUTION_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
@@ -44,28 +46,43 @@ pub(in crate::call) fn pack<T: Serialize, const N: usize>(
     metadata: &T,
     payloads: [Vec<u8>; N],
 ) -> Result<Vec<u8>, ExecutionEncodingError> {
+    pack_with_limit(prefix, metadata, payloads, MAX_EXECUTION_PAYLOAD_BYTES)
+}
+
+pub(in crate::call) fn pack_with_limit<T: Serialize, const N: usize>(
+    prefix: [u8; 4],
+    metadata: &T,
+    payloads: [Vec<u8>; N],
+    maximum: usize,
+) -> Result<Vec<u8>, ExecutionEncodingError> {
     let header_bytes = 4 + 4 * (N + 1);
     let raw_bytes = payloads
         .iter()
-        .fold(0usize, |total, bytes| total.saturating_add(bytes.len()));
-    if raw_bytes > MAX_EXECUTION_PAYLOAD_BYTES {
+        .try_fold(0usize, |total, bytes| total.checked_add(bytes.len()))
+        .ok_or(ExecutionEncodingError)?;
+    if raw_bytes > maximum {
         return Err(ExecutionEncodingError);
     }
     let metadata = serde_json::to_vec(metadata).map_err(|_| ExecutionEncodingError)?;
     let total = header_bytes
-        .saturating_add(metadata.len())
-        .saturating_add(raw_bytes);
-    if total > MAX_EXECUTION_PAYLOAD_BYTES {
+        .checked_add(metadata.len())
+        .and_then(|total| total.checked_add(raw_bytes))
+        .ok_or(ExecutionEncodingError)?;
+    let lengths = std::iter::once(metadata.len())
+        .chain(payloads.iter().map(Vec::len))
+        .map(u32::try_from)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| ExecutionEncodingError)?;
+    if total > maximum {
         return Err(ExecutionEncodingError);
     }
-    let mut result = Vec::with_capacity(total);
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(total)
+        .map_err(|_| ExecutionEncodingError)?;
     result.extend_from_slice(&prefix);
-    for length in std::iter::once(metadata.len()).chain(payloads.iter().map(Vec::len)) {
-        result.extend_from_slice(
-            &u32::try_from(length)
-                .map_err(|_| ExecutionEncodingError)?
-                .to_be_bytes(),
-        );
+    for length in lengths {
+        result.extend_from_slice(&length.to_be_bytes());
     }
     result.extend_from_slice(&metadata);
     for bytes in payloads {
@@ -78,25 +95,30 @@ pub(in crate::call) fn unpack<T: DeserializeOwned, const N: usize>(
     prefix: [u8; 4],
     bytes: &[u8],
 ) -> Result<(T, [&[u8]; N]), ExecutionEncodingError> {
+    unpack_with_limit(prefix, bytes, MAX_EXECUTION_PAYLOAD_BYTES)
+}
+
+pub(in crate::call) fn unpack_with_limit<T: DeserializeOwned, const N: usize>(
+    prefix: [u8; 4],
+    bytes: &[u8],
+    maximum: usize,
+) -> Result<(T, [&[u8]; N]), ExecutionEncodingError> {
     let header_bytes = 4 + 4 * (N + 1);
-    if bytes.len() < header_bytes
-        || bytes.len() > MAX_EXECUTION_PAYLOAD_BYTES
-        || bytes[..4] != prefix
-    {
+    if bytes.len() < header_bytes || bytes.len() > maximum || bytes[..4] != prefix {
         return Err(ExecutionEncodingError);
     }
     let mut cursor = header_bytes;
     let mut metadata = &[][..];
     let mut payloads = [&[][..]; N];
-    // 先验证全部分段边界，不能根据对端的长度声明直接分配。
+    // 先验证全部分段边界，不能根据对端的长度声明直接分配
     for (chunk, target) in bytes[4..header_bytes]
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .zip(std::iter::once(&mut metadata).chain(payloads.iter_mut()))
     {
-        let length = usize::try_from(u32::from_be_bytes(
-            chunk.try_into().map_err(|_| ExecutionEncodingError)?,
-        ))
-        .map_err(|_| ExecutionEncodingError)?;
+        let length =
+            usize::try_from(u32::from_be_bytes(*chunk)).map_err(|_| ExecutionEncodingError)?;
         let end = cursor.checked_add(length).ok_or(ExecutionEncodingError)?;
         *target = bytes.get(cursor..end).ok_or(ExecutionEncodingError)?;
         cursor = end;
@@ -120,6 +142,7 @@ fn attach(target: Option<&mut Vec<u8>>, bytes: &[u8]) -> Result<(), ExecutionEnc
 fn raw_wire(wire: Option<&mut super::WireEvent>) -> Option<&mut Vec<u8>> {
     match &mut wire?.payload {
         WirePayload::Json { raw_sse, .. } => raw_sse.as_mut(),
+        WirePayload::WebSocket { message, .. } => Some(message),
         WirePayload::RawSse { frame } => Some(frame),
         WirePayload::RawJson { body } | WirePayload::RawBody { body } => Some(body),
     }

@@ -1,15 +1,15 @@
 # Gateway Plugin SDK
 
 用于编写 Codex Proxy 插件的 Rust 合同与可选会话辅助。插件只依赖本包，不依赖宿主 Core、Admin、Store 或 Host。
-SDK 仍处于实验阶段；能力是否可用取决于宿主支持、清单声明与实际注册，
+SDK 处于实验阶段；能力是否可用取决于宿主支持、清单声明与实际注册，
 而不只是枚举中存在该名称
 
 | 版本 | 当前值 | 用途 |
 | --- | --- | --- |
 | SDK 包 | `0.1.0` | Rust 开发依赖，独立于网关版本 |
 | `manifestVersion` | `2` | 安装清单格式 |
-| `package.protocolVersion` | `2` | 宿主与插件的进程通信 |
-| `contributes.*.version` | 默认 `1`，`middleware` 必须为 `3` | 单项能力合同，见[扩展项声明](docs/manifest.md#扩展项简写) |
+| `package.protocolVersion` | `5` | 宿主与插件的进程通信 |
+| `contributes.*.version` | `middleware` 为 `5`，`scheduler` 为 `3`，`upstream_adapter` 为 `4`，其余见声明 | 单项能力合同，见[扩展项声明](docs/manifest.md#扩展项简写) |
 
 开发顺序：编写[清单](docs/manifest.md) → 实现[能力处理器](docs/capabilities.md) → 用 [CLI](../../../apps/plugin-cli/README.md)
 打包 → [安装、配置与启用](../../../../docs/plugins.md)。完整可运行示例位于独立仓库
@@ -25,7 +25,7 @@ SDK 仍处于实验阶段；能力是否可用取决于宿主支持、清单声�
 | `call::frontend_authentication` | 数据面认证信封、认证器标识与外部 principal 结果 |
 | `call::model` | 宿主模型调用的 canonical 事实、原生 wire 与有界事件编解码 |
 | `call::middleware` | HTTP、WebSocket 消息、公开服务、模型请求及 attempt 的洋葱调用、单次 next 与惰性正文合同 |
-| `call::services` | 公开服务的类型化操作、输入输出及错误合同 |
+| `call::services` | 公开服务的类型化操作、输入输出及错误合同；`usage` 提供[用量维护与计价](docs/usage-data.md) |
 | `call::upstream_adapter` | 内置 OpenAI / xAI 的[受管上游适配器](docs/upstream-adapters.md)注册、执行、出站与续接合同 |
 | `call::policy` | 模型路由、账号调度与重试决策合同 |
 | `call::catalog` | 固定 Provider 的模型别名注册合同 |
@@ -52,6 +52,12 @@ use gateway_plugin_sdk::client::{read_frame, write_frame};
 `PluginSession::accept/run` 和 `PluginHandler`。组合插件从作者清单建立类型化方法，SDK 自动生成
 `plugin.register`；作者不需要复制贡献项或手写方法名、阶段和敏感载荷编解码。
 会话管理握手、有界并发、父调用关联、回调、流信用、取消、排空与关闭。
+
+`SessionConfig.maximum_calls` 默认 256，限制包含下游等待和响应流在内的在途调用；`maximum_callbacks` 默认 64，
+限制普通宿主回调。`next` 使用独立回调预算，上限为 `maximum_calls`，不挤占普通回调容量。
+宿主负责执行与准入调度，等待与处理独立计时；默认预算与过载行为见[插件使用](../../../../docs/plugins.md#故障处理)。
+插件显式覆盖配置时需与宿主协调在途预算；较小的插件侧上限会提前拒绝新调用
+
 `ResponseStream::channel` 提供有界流生产入口，`ResponseStream::pull` 按消费进度驱动生产者；`PluginCall` 的宿主客户端只代表当前父调用，
 不能把一个调用的资源误用到另一个调用。插件程序自行选择运行时和启动入口，不会启动网关。
 `SessionConfig.maximum_stream_chunk_bytes` 默认 1 MiB，只约束单个业务流分块；
@@ -86,37 +92,50 @@ sequenceDiagram
 首个流式结果成功返回后，正文、会话及关联回调由资源取消与终态回收，不再沿用初始期限。
 普通调用继续使用原期限；资源模式仍保留并发容量、Credit、父调用关联及取消约束
 
-协议 v2 的帧头由大端 `u32` 元数据长度和大端 `u64` 正文长度组成，随后依次传输 JSON 元数据和原始二进制正文。
+协议 v5 的帧头由大端 `u32` 元数据长度和大端 `u64` 载荷长度组成，随后依次传输 JSON 元数据和二进制载荷。
 元数据保留 64 KiB 上限；正文总量不由插件传输层额外限制。传输内部以 256 KiB 为单次 I/O 块，
 不逐块发起 RPC，也不要求插件配置与宿主同步。读取按进度扩展缓冲区；截断正文必须报错，不能作为完整消息交付
 
-`read_frame` / `write_frame` 使用协议 v2。帧写入队列之前先用 `validate_frame` 校验元数据，
-避免本地输入错误关闭共享传输。协议校验不会自动重试业务调用；部分读写中断后不能把当前位置当作新帧边界。
-底层 `read_frame` / `write_frame` 不是取消安全的；自行编排会话时，不能在 `select!` 的其他分支完成后
+JSON 元数据只承载消息类别、调用关联及分段长度。载荷依次包含入口快照 JSON、业务 JSON 和原始二进制正文：
+
+- `request_context_bytes` 指定 `CallContext.request` 的快照长度；无快照时省略
+- `data_bytes` 指定 `Hello.configuration`、`Call.params`、`Callback.params` 或 `Result.result` 的 JSON 长度；这些消息必须携带该段，其他消息省略
+- 两个 JSON 段之后的剩余字节是 `Frame.payload`，其内容不经过 JSON 编码
+
+入口快照的 `headers[].value` 使用标准带填充 base64 字符串，保留重复头与任意字节；Rust API 仍为 `Vec<u8>`。这个表示法仅用于 `RequestContext`，不改变中间件业务数据的头值合同
+
+SDK 帧读写器自动拆装这些字段，不拼接复制二进制正文。`Message` 与 `Handshake` 的 serde 表示只包含控制字段；完整消息应通过 `read_frame` / `write_frame` 读写
+
+帧写入队列前用 `EncodedFrame::new` 完成编码和校验，写泵通过 `EncodedFrame::write` 复用编码结果，
+避免重复序列化或让本地输入错误关闭共享传输。编码帧不保留业务 JSON 与入口快照的原始副本，
+`EncodedFrame::message` 仅供关联消息类别和 ID。只需校验时可使用 `validate_frame`。
+协议校验不会自动重试业务调用；部分读写中断后不能把当前位置当作新帧边界。
+底层帧读写方法不是取消安全的；自行编排会话时，不能在 `select!` 的其他分支完成后
 重建半途中的帧读写。`PluginSession` 会在处理调用完成通知时保留同一个读取 future，直到完整帧到达或会话关闭
 
-会话由宿主发送 `Hello`，插件校验协议后返回携带相同 incarnation 的 `Ready`。
-注册结果必须与清单中的能力一致。一次 `Call` 的结果、错误和流帧按 ID 关联；回调必须
-携带当前父调用 ID。实例、代次、阶段、账号或资源 ID 用于关联调用和管理资源生命周期
+插件须校验 `Hello` 的协议版本。一次 `Call` 的结果、错误和流帧按 ID 关联；实例、代次、阶段、账号或资源 ID 用于关联调用和管理资源生命周期
 
 ## 本地验证
 
-设置服务的 SDK 类型和操作由宿主领域类型及[操作声明](../../gateway-admin/src/service/settings.rs)生成，SDK 构建不依赖宿主源码。
+设置与账号自动重置服务的 SDK 类型和操作由宿主领域类型及[操作声明](../../gateway-admin/src/public_service)生成，SDK 构建不依赖宿主源码。
 修改宿主合同后，在仓库根目录更新生成文件；Admin 合同测试会检查生成结果是否同步：
 
 ```bash
-CPR_UPDATE_SERVICE_CONTRACT=1 RUST_MIN_STACK=16777216 cargo +1.97.0 test --manifest-path backend/Cargo.toml -p gateway-admin --test main sdk_settings_contract_matches_host_declarations --locked
-cargo +1.97.0 fmt --all --manifest-path backend/Cargo.toml
+CPR_UPDATE_SERVICE_CONTRACT=1 RUST_MIN_STACK=16777216 cargo +1.99.1 test --manifest-path backend/Cargo.toml -p gateway-admin --test main sdk_settings_contract_matches_host_declarations --locked
+CPR_UPDATE_SERVICE_CONTRACT=1 RUST_MIN_STACK=16777216 cargo +1.99.1 test --manifest-path backend/Cargo.toml -p gateway-admin --test main sdk_accounts_contract_matches_host_declarations --locked
+cargo +1.99.1 fmt --all --manifest-path backend/Cargo.toml
 ```
+
+用量服务合同由 Admin 与 SDK 分别持有，`sdk_wire_types_match_host_contracts` 检查数值、明细、聚合、查询和计价类型一致性；修改合同需同步两侧类型与 [使用说明](docs/usage-data.md)
 
 SDK 自身的验证命令：
 
 ```bash
-RUST_MIN_STACK=16777216 cargo +1.97.0 test --manifest-path backend/Cargo.toml -p gateway-plugin-sdk --no-default-features --locked
-RUST_MIN_STACK=16777216 cargo +1.97.0 test --manifest-path backend/Cargo.toml -p gateway-plugin-sdk --all-features --locked
-RUST_MIN_STACK=16777216 RUSTDOCFLAGS='-D warnings' cargo +1.97.0 doc --manifest-path backend/Cargo.toml -p gateway-plugin-sdk --all-features --no-deps --locked
+RUST_MIN_STACK=16777216 cargo +1.99.1 test --manifest-path backend/Cargo.toml -p gateway-plugin-sdk --no-default-features --locked
+RUST_MIN_STACK=16777216 cargo +1.99.1 test --manifest-path backend/Cargo.toml -p gateway-plugin-sdk --all-features --locked
+RUST_MIN_STACK=16777216 RUSTDOCFLAGS='-D warnings' cargo +1.99.1 doc --manifest-path backend/Cargo.toml -p gateway-plugin-sdk --all-features --no-deps --locked
 ```
 
-源码中的类型和字段是当前合同；宿主接入、目录边界与 Runtime 集成验证见
-[系统架构](../../../../docs/architecture.md)。Provider 固定为宿主内置的 OpenAI 与 xAI；插件实现只依赖公开 SDK 合同。
+源码中的类型和字段是当前合同；宿主接入、目录边界、内置 Provider 与 Runtime 集成验证见
+[系统架构](../../../../docs/architecture.md#31-插件扩展)。
 单元测试与文档构建不代替目标平台上的安装、配置及实际能力验证

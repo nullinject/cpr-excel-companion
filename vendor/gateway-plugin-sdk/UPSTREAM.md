@@ -1,4 +1,4 @@
 Source: https://github.com/zyycn/codex-proxy-rs
-Tag: v3.18.2
-Commit: e30aad475560b94db2d999e2251d180e45d52671
+Tag: v3.29.7
+Commit: 78bc57c5cf24b01a38e985cdd739bb4ae89ce11f
 Cargo.toml retains standalone package metadata.

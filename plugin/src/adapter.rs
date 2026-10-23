@@ -59,24 +59,24 @@ fn scope(call: &TypedCall<UpstreamAdapterRequest>) -> String {
     ])
     .to_string()
 }
-fn headers(excel: bool, request: &UpstreamAdapterRequest) -> Vec<(String, String)> {
+fn headers(excel: bool, request: &UpstreamAdapterRequest) -> Vec<(String, Vec<u8>)> {
     // Never forward client credentials or allow client headers to override host identity.
     let mut headers = vec![
-        ("content-type".into(), "application/json".into()),
-        ("accept".into(), "text/event-stream".into()),
+        ("content-type".into(), b"application/json".to_vec()),
+        ("accept".into(), b"text/event-stream".to_vec()),
     ];
     for (name, bytes) in &request.headers {
         if matches!(
             name.to_ascii_lowercase().as_str(),
             "session-id" | "conversation-id" | "openai-beta" | "originator" | "version"
-        ) && let Ok(value) = std::str::from_utf8(bytes)
+        ) && std::str::from_utf8(bytes).is_ok()
         {
-            headers.push((name.clone(), value.into()));
+            headers.push((name.clone(), bytes.clone()));
         }
     }
     if excel {
         for (name, value) in EXCEL_HEADERS {
-            headers.push(((*name).into(), (*value).into()));
+            headers.push(((*name).into(), value.as_bytes().to_vec()));
         }
     }
     headers
@@ -109,13 +109,13 @@ const EXCEL_HEADERS: &[(&str, &str)] = &[
 ];
 async fn upload(
     host: &HostClient,
-    headers: &[(String, String)],
+    headers: &[(String, Vec<u8>)],
     source: &mut Value,
 ) -> Result<(), PluginFault> {
     excel::attachments::upload_with(source, |content_type, body| {
         let mut headers = headers.to_vec();
         headers.retain(|(name, _)| name != "content-type" && name != "accept");
-        headers.push(("content-type".into(), content_type));
+        headers.push(("content-type".into(), content_type.as_bytes().to_vec()));
         async move {
             let response = host
                 .upstream_http(
