@@ -1,12 +1,12 @@
 //! 按账户保存的 Excel 通道授权。
 //!
-//! 采用与 Excel 加载项相同的 SIWC（Sign in with ChatGPT）授权：动态客户端、PKCE、
-//! `chatgpt.tokens.use.direct` 直接调用权限。授权按 CPR 账户 ID 隔离，落盘在策略文件同目录。
+//! 复用 Excel 加载项自己的设备授权流程（`deviceauth`）：
+//! 浏览器完成登录后得到一次性 `user_code`，再用 `device_auth_id + user_code` 换取 token。
+//! 授权按 CPR 账户 ID 隔离，落盘在策略文件同目录。
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use gateway_plugin_sdk::{ErrorCode, PluginFault, call::host::HttpRequest, client::HostClient};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs,
@@ -14,20 +14,13 @@ use std::{
     sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
-use uuid::Uuid;
 
-/// SIWC 首次注册使用的动态客户端；回调会返回签发后的 `oaiapp_…`。
-const DYNAMIC_CLIENT_ID: &str = "dynamic_agent_client";
-const AUTHORIZE_URL: &str = "https://auth.openai.com/api/accounts/authorize";
-const TOKEN_URL: &str = "https://auth.openai.com/api/accounts/oauth/token";
-const RESOURCE: &str = "https://api.openai.com/v1";
-/// Excel 加载项等第三方应用使用的 loopback 回调。
-pub const REDIRECT_URI: &str = "http://127.0.0.1:1455/auth/callback";
-/// `chatgpt.tokens.use.direct` 是直接调用权限，缺它即无法代表用户发起推理。
-const SCOPE: &str = "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct";
-const AGENT_NAME: &str = "Excel Companion";
-const PENDING_TTL_SECONDS: u64 = 900;
-const MAX_CALLBACK_BYTES: usize = 8192;
+/// Excel 加载项（AppSource WA200010215）自己的 OAuth 客户端。
+const CLIENT_ID: &str = "app_fnr0pYvVwwFDocDumLG3H2Bp";
+const AUTHORIZE_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/authorize";
+const TOKEN_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
+const PENDING_TTL_SECONDS: u64 = 1800;
+const MAX_CODE_BYTES: usize = 128;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -36,17 +29,13 @@ pub struct Session {
     pub access_token: String,
     #[serde(default)]
     pub refresh_token: String,
-    /// 签发后的客户端 ID（oaiapp_…），重登与刷新都要用它
-    #[serde(default)]
-    pub client_id: String,
-    /// OpenAI 账号 ID（来自 access token 的 claims）
     #[serde(default)]
     pub openai_account_id: String,
     #[serde(default)]
     pub openai_user_id: String,
     #[serde(default)]
     pub scopes: Vec<String>,
-    /// 会话来源：`siwc` 为本插件登录，`excel-addin` 为从 Excel 加载项缓存导入
+    /// 会话来源：`excel-addin` 表示按加载项设备授权取得
     #[serde(default)]
     pub source: String,
     /// Unix 秒；0 表示上游未返回有效期
@@ -56,15 +45,11 @@ pub struct Session {
 
 #[derive(Default, Serialize, Deserialize)]
 struct Store {
-    /// 稳定的本机标识，参与 SIWC 的 `ext_agent_host_id`
-    #[serde(default)]
-    host_id: String,
     #[serde(default)]
     accounts: BTreeMap<String, Session>,
 }
 
 struct Pending {
-    verifier: String,
     account_id: String,
     created: u64,
 }
@@ -86,17 +71,6 @@ fn now() -> u64 {
         .unwrap_or_default()
 }
 
-fn random_token() -> String {
-    let mut bytes = Vec::with_capacity(32);
-    bytes.extend_from_slice(Uuid::new_v4().as_bytes());
-    bytes.extend_from_slice(Uuid::new_v4().as_bytes());
-    URL_SAFE_NO_PAD.encode(bytes)
-}
-
-fn challenge(verifier: &str) -> String {
-    URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
-}
-
 fn jwt_claims(token: &str) -> Value {
     token
         .split('.')
@@ -116,27 +90,25 @@ fn claim(claims: &Value, name: &str) -> String {
         .to_owned()
 }
 
+fn header<'a>(headers: &'a [(String, Vec<u8>)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .and_then(|(_, value)| std::str::from_utf8(value).ok())
+}
+
 impl Auth {
     pub fn load(path: PathBuf) -> Result<Self, std::io::Error> {
-        let mut store: Store = match fs::read(&path) {
+        let store: Store = match fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Store::default(),
             Err(error) => return Err(error),
         };
-        let auth = Self {
+        Ok(Self {
             path,
-            store: Mutex::new(Store::default()),
+            store: Mutex::new(store),
             pending: Mutex::new(BTreeMap::new()),
-        };
-        if store.host_id.is_empty() {
-            store.host_id = format!("urn:uuid:{}", Uuid::new_v4());
-            let _ = auth.save(&store);
-        }
-        *auth
-            .store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = store;
-        Ok(auth)
+        })
     }
 
     fn save(&self, store: &Store) -> Result<(), PluginFault> {
@@ -161,73 +133,60 @@ impl Auth {
         Ok(())
     }
 
-    /// 生成 SIWC 授权链接；`state` 同时用于回调校验与一次性关联。
-    pub fn start(&self, account_id: &str) -> Result<Value, PluginFault> {
+    /// 向加载项的设备授权端点取一次跳转地址；`state` 即 `device_auth_id`。
+    pub async fn start(&self, host: &HostClient, account_id: &str) -> Result<Value, PluginFault> {
         if account_id.is_empty() || account_id.len() > 128 {
             return Err(fault("invalid account id"));
         }
-        let verifier = random_token();
-        let state = random_token();
-        let (client_id, host_id) = {
-            let store = self
-                .store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let client = store
-                .accounts
-                .get(account_id)
-                .map(|session| session.client_id.clone())
-                .filter(|value| value.starts_with("oaiapp_"))
-                .unwrap_or_else(|| DYNAMIC_CLIENT_ID.to_owned());
-            (client, store.host_id.clone())
-        };
+        let response = host
+            .http(
+                HttpRequest {
+                    method: "GET".into(),
+                    url: format!("{AUTHORIZE_URL}?client_id={CLIENT_ID}"),
+                    headers: vec![("accept".into(), b"application/json".to_vec())],
+                },
+                Vec::new(),
+            )
+            .await?;
+        let location = header(&response.headers, "location")
+            .ok_or_else(|| fault("device authorization did not return a redirect"))?
+            .to_owned();
+        let device_auth_id = location
+            .split_once("state=")
+            .map(|(_, rest)| rest.split('&').next().unwrap_or_default())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| fault("device authorization has no state"))?
+            .to_owned();
         let mut pending = self
             .pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         pending.retain(|_, item| now().saturating_sub(item.created) < PENDING_TTL_SECONDS);
         pending.insert(
-            state.clone(),
+            device_auth_id.clone(),
             Pending {
-                verifier: verifier.clone(),
                 account_id: account_id.to_owned(),
                 created: now(),
             },
         );
-        let query = [
-            ("client_id", client_id),
-            ("ext_agent_host_id", host_id),
-            ("response_type", "code".to_owned()),
-            ("redirect_uri", REDIRECT_URI.to_owned()),
-            ("scope", SCOPE.to_owned()),
-            ("resource", RESOURCE.to_owned()),
-            ("state", state.clone()),
-            ("code_challenge_method", "S256".to_owned()),
-            ("code_challenge", challenge(&verifier)),
-            ("agent_name_hint", AGENT_NAME.to_owned()),
-        ];
-        let encoded: Vec<String> = query
-            .iter()
-            .map(|(name, value)| format!("{}={}", name, url_encode(value)))
-            .collect();
         Ok(json!({
             "accountId": account_id,
-            "state": state,
-            "redirectUri": REDIRECT_URI,
-            "url": format!("{AUTHORIZE_URL}?{}", encoded.join("&")),
+            "deviceAuthId": device_auth_id,
+            "url": location,
             "expiresInSeconds": PENDING_TTL_SECONDS,
         }))
     }
 
-    /// 用回调地址（或纯 code）完成换取；成功后按账户保存。
+    /// 用浏览器页面上的 `user_code` 换取 token。
     pub async fn complete(
         &self,
         host: &HostClient,
-        state: &str,
-        callback: &str,
+        device_auth_id: &str,
+        user_code: &str,
     ) -> Result<Session, PluginFault> {
-        if callback.len() > MAX_CALLBACK_BYTES {
-            return Err(fault("callback is too large"));
+        let user_code = user_code.trim();
+        if user_code.is_empty() || user_code.len() > MAX_CODE_BYTES {
+            return Err(fault("invalid user code"));
         }
         let pending = {
             let mut pending = self
@@ -235,52 +194,36 @@ impl Auth {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let entry = pending
-                .remove(state)
-                .ok_or_else(|| fault("unknown or expired state"))?;
+                .remove(device_auth_id)
+                .ok_or_else(|| fault("unknown or expired device authorization"))?;
             if now().saturating_sub(entry.created) >= PENDING_TTL_SECONDS {
-                return Err(fault("authorization expired; start again"));
+                return Err(fault("device authorization expired; start again"));
             }
             entry
         };
-        let code = extract_param(callback, "code")
-            .ok_or_else(|| fault("callback has no authorization code"))?;
-        // SIWC 在回调里返回签发后的客户端 ID；缺失时才退回动态客户端。
-        let client_id = extract_param(callback, "client_id")
-            .filter(|value| value.starts_with("oaiapp_"))
-            .unwrap_or_else(|| DYNAMIC_CLIENT_ID.to_owned());
-        let body = [
-            ("grant_type", "authorization_code".to_owned()),
-            ("client_id", client_id.clone()),
-            ("code", code),
-            ("code_verifier", pending.verifier.clone()),
-            ("redirect_uri", REDIRECT_URI.to_owned()),
-            ("resource", RESOURCE.to_owned()),
-        ]
-        .iter()
-        .map(|(name, value)| format!("{}={}", name, url_encode(value)))
-        .collect::<Vec<_>>()
-        .join("&");
+        let body = serde_json::to_vec(&json!({
+            "device_auth_id": device_auth_id,
+            "user_code": user_code,
+        }))
+        .map_err(|_| fault("authorization encoding failed"))?;
         let response = host
             .http(
                 HttpRequest {
                     method: "POST".into(),
                     url: TOKEN_URL.into(),
                     headers: vec![
-                        (
-                            "content-type".into(),
-                            b"application/x-www-form-urlencoded".to_vec(),
-                        ),
+                        ("content-type".into(), b"application/json".to_vec()),
                         ("accept".into(), b"application/json".to_vec()),
                     ],
                 },
-                body.into_bytes(),
+                body,
             )
             .await?;
         let status = response.status;
         let bytes = response.body.collect(65536).await?;
         if status != 200 {
-            eprintln!("excel_auth: SIWC token exchange rejected with status {status}");
-            return Err(fault("authorization was rejected by the identity service"));
+            eprintln!("excel_auth: device token exchange rejected with status {status}");
+            return Err(fault("authorization code was rejected"));
         }
         let value: Value =
             serde_json::from_slice(&bytes).map_err(|_| fault("invalid token response"))?;
@@ -289,19 +232,6 @@ impl Auth {
             .filter(|token| !token.is_empty())
             .ok_or_else(|| fault("token response has no access token"))?
             .to_owned();
-        let scopes: Vec<String> = value["scope"]
-            .as_str()
-            .unwrap_or_default()
-            .split_whitespace()
-            .map(str::to_owned)
-            .collect();
-        if !scopes.is_empty()
-            && !scopes
-                .iter()
-                .any(|scope| scope == "chatgpt.tokens.use.direct")
-        {
-            return Err(fault("authorization lacks chatgpt.tokens.use.direct"));
-        }
         let claims = jwt_claims(&access_token);
         let expires_at = value["expires_in"]
             .as_u64()
@@ -314,11 +244,10 @@ impl Auth {
                 .as_str()
                 .unwrap_or_default()
                 .to_owned(),
-            client_id,
             openai_account_id: claim(&claims, "chatgpt_account_id"),
             openai_user_id: claim(&claims, "chatgpt_account_user_id"),
-            scopes,
-            source: "siwc".to_owned(),
+            scopes: Vec::new(),
+            source: "excel-addin".to_owned(),
             expires_at,
         };
         let mut store = self
@@ -344,9 +273,8 @@ impl Auth {
                 json!({
                     "accountId": session.account_id,
                     "expiresAt": session.expires_at,
-                    "expired": !usable(session) || (session.expires_at != 0 && session.expires_at <= now()),
+                    "expired": session.expires_at != 0 && session.expires_at <= now(),
                     "openaiAccountId": session.openai_account_id,
-                    "scopes": session.scopes,
                     "source": session.source,
                 })
             })
@@ -366,17 +294,12 @@ impl Auth {
     }
 
     /// 账户已授权且未过期时返回可用于覆盖宿主凭据的会话。
-    ///
-    /// 只认 SIWC 授权：旧版本按 Codex OAuth 存的会话没有 direct 权限，一律视为未授权。
     pub fn session_for(&self, account_id: &str) -> Option<Session> {
         let store = self
             .store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let session = store.accounts.get(account_id)?;
-        if !usable(session) {
-            return None;
-        }
         if session.expires_at != 0 && session.expires_at <= now() {
             return None;
         }
@@ -384,98 +307,24 @@ impl Auth {
     }
 }
 
-/// 可直接用于 Excel 通道的会话：SIWC 需带 direct 权限，加载项导入的会话本身即 BPS 受众。
-fn usable(session: &Session) -> bool {
-    session.source == "excel-addin"
-        || session
-            .scopes
-            .iter()
-            .any(|scope| scope == "chatgpt.tokens.use.direct")
-}
-
-fn url_encode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char);
-            }
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
-}
-
-/// 接受完整回调地址、仅查询串或裸 code。
-fn extract_param(callback: &str, name: &str) -> Option<String> {
-    let query = callback
-        .split_once('?')
-        .map(|(_, rest)| rest)
-        .unwrap_or(callback);
-    for pair in query.split('&') {
-        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-        if key == name && !value.is_empty() {
-            return Some(percent_decode(value));
-        }
-    }
-    if name == "code" {
-        let trimmed = callback.trim();
-        if !trimmed.is_empty() && !trimmed.contains(['?', '&', '=']) {
-            return Some(trimmed.to_owned());
-        }
-    }
-    None
-}
-
-fn percent_decode(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len() {
-            let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).ok();
-            if let Some(byte) = hex.and_then(|hex| u8::from_str_radix(hex, 16).ok()) {
-                out.push(byte);
-                index += 3;
-                continue;
-            }
-        }
-        out.push(bytes[index]);
-        index += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn extracts_code_and_client_from_callback() {
-        let callback =
-            "http://127.0.0.1:1455/auth/callback?code=abc123&state=x&client_id=oaiapp_Test-1";
-        assert_eq!(extract_param(callback, "code").as_deref(), Some("abc123"));
-        assert_eq!(
-            extract_param(callback, "client_id").as_deref(),
-            Some("oaiapp_Test-1")
-        );
-        assert_eq!(
-            extract_param("code=abc%2Fdef", "code").as_deref(),
-            Some("abc/def")
-        );
-        assert_eq!(
-            extract_param("  abc123  ", "code").as_deref(),
-            Some("abc123")
-        );
-        assert!(
-            extract_param("http://127.0.0.1:1455/auth/callback?error=denied", "code").is_none()
-        );
+    fn extracts_device_auth_id_from_redirect() {
+        let location = "https://auth.openai.com/oauth/authorize?response_type=code&client_id=app_x\
+&redirect_uri=https%3A%2F%2Fauth.openai.com%2Fbasispoints%2Fdeviceauth%2Fcallback\
+&state=deviceauth-v2.abc123&code_challenge=xyz";
+        let value = location
+            .split_once("state=")
+            .map(|(_, rest)| rest.split('&').next().unwrap_or_default());
+        assert_eq!(value, Some("deviceauth-v2.abc123"));
     }
 
     #[test]
-    fn pkce_challenge_is_stable() {
-        let verifier = "test-verifier";
-        assert_eq!(challenge(verifier), challenge(verifier));
-        assert_ne!(challenge(verifier), challenge("other"));
+    fn header_lookup_is_case_insensitive() {
+        let headers = vec![("Location".to_owned(), b"https://x".to_vec())];
+        assert_eq!(header(&headers, "location"), Some("https://x"));
     }
 }

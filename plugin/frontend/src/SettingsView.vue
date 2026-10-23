@@ -35,8 +35,8 @@ interface AuthEntry {
 const authEntries = ref(new Map<string, AuthEntry>())
 const authBusy = ref('')
 const authError = ref('')
-const authPending = ref<{ accountId: string, state: string, url: string } | null>(null)
-const authCallback = ref('')
+const authPending = ref<{ accountId: string, deviceAuthId: string, url: string } | null>(null)
+const authCode = ref('')
 const authCopied = ref(false)
 
 // iframe 里 window.open 会被 sandbox 拦掉，因此链接必须可见、可复制。
@@ -98,11 +98,11 @@ async function toggleAuth(accountId: string, next: boolean) {
   }
   authBusy.value = accountId
   try {
-    const started = await api<{ state: string, url: string }>('api/auth/start', {
+    const started = await api<{ deviceAuthId: string, url: string }>('api/auth/start', {
       account_id: accountId,
     })
-    authPending.value = { accountId, state: started.state, url: started.url }
-    authCallback.value = ''
+    authPending.value = { accountId, deviceAuthId: started.deviceAuthId, url: started.url }
+    authCode.value = ''
     authCopied.value = false
     // sandbox iframe 拦截 window.open，链接由用户复制到浏览器打开
   }
@@ -123,8 +123,8 @@ async function completeAuth() {
   authError.value = ''
   try {
     await api('api/auth/complete', {
-      state: pending.state,
-      callback: authCallback.value.trim(),
+      device_auth_id: pending.deviceAuthId,
+      user_code: authCode.value.trim(),
     })
     authPending.value = null
     await loadAuthStatus()
@@ -455,13 +455,12 @@ onMounted(loadAuthStatus)
                 </button>
               </div>
               <p>
-                <strong>第 2 步</strong>：登录后浏览器会跳到
-                <code>127.0.0.1:1455</code>（页面打不开是正常的），把地址栏完整地址粘到下面。
+                <strong>第 2 步</strong>：登录完成后页面会显示一段授权码，把它粘到下面。
               </p>
               <input
-                v-model="authCallback"
+                v-model="authCode"
                 type="text"
-                placeholder="http://127.0.0.1:1455/auth/callback?code=…&state=…"
+                placeholder="页面上显示的授权码"
                 autocomplete="off"
                 spellcheck="false"
               >

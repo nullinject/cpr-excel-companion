@@ -121,27 +121,27 @@ pub async fn handle(
             let Ok(value) = serde_json::from_slice::<Start>(&call.payload) else {
                 return Ok(json_error(400, "invalid authorization request"));
             };
-            Ok(match auth.start(&value.account_id) {
+            Ok(match auth.start(&call.host, &value.account_id).await {
                 Ok(value) => reply(
                     200,
                     serde_json::to_vec(&value)
                         .map_err(|_| fault("authorization encoding failed"))?,
                 ),
-                Err(_) => json_error(400, "invalid account id"),
+                Err(_) => json_error(400, "无法开始设备授权"),
             })
         }
         ("POST", "api/auth/complete") => {
             #[derive(serde::Deserialize)]
             #[serde(deny_unknown_fields)]
             struct Complete {
-                state: String,
-                callback: String,
+                device_auth_id: String,
+                user_code: String,
             }
             let Ok(value) = serde_json::from_slice::<Complete>(&call.payload) else {
                 return Ok(json_error(400, "invalid callback request"));
             };
             match auth
-                .complete(&call.host, &value.state, &value.callback)
+                .complete(&call.host, &value.device_auth_id, &value.user_code)
                 .await
             {
                 Ok(session) => Ok(reply(
