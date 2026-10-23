@@ -404,7 +404,7 @@ onMounted(loadAuthStatus)
                 <label
                   class="gw-switch"
                   :class="{ 'is-on': authorized(account.account_id) }"
-                  :title="authorized(account.account_id) ? '关闭将解除该账户的 BPS 授权' : '开启后登录一次，授权该账户使用 BPS 通道'"
+                  :title="authorized(account.account_id) ? '关闭将解除该账户的 BPS 授权' : '开启后完成一次 ChatGPT 授权（Excel 同款 SIWC），该账户即可使用 Excel 通道'"
                 >
                   <input
                     type="checkbox"

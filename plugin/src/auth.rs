@@ -1,6 +1,7 @@
-//! 按账户保存的 Excel/BPS 授权：Codex OAuth（PKCE）换取 token，落盘在策略文件同目录。
+//! 按账户保存的 Excel 通道授权。
 //!
-//! 授权按 CPR 账户 ID 隔离；未授权的账户继续使用宿主注入的凭据，行为不变。
+//! 采用与 Excel 加载项相同的 SIWC（Sign in with ChatGPT）授权：动态客户端、PKCE、
+//! `chatgpt.tokens.use.direct` 直接调用权限。授权按 CPR 账户 ID 隔离，落盘在策略文件同目录。
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use gateway_plugin_sdk::{ErrorCode, PluginFault, call::host::HttpRequest, client::HostClient};
 use serde::{Deserialize, Serialize};
@@ -15,13 +16,17 @@ use std::{
 };
 use uuid::Uuid;
 
-const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-const AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
-const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
-/// 与 Codex Desktop 相同的 loopback 回调；授权结束后浏览器地址栏即回调地址。
+/// SIWC 首次注册使用的动态客户端；回调会返回签发后的 `oaiapp_…`。
+const DYNAMIC_CLIENT_ID: &str = "dynamic_agent_client";
+const AUTHORIZE_URL: &str = "https://auth.openai.com/api/accounts/authorize";
+const TOKEN_URL: &str = "https://auth.openai.com/api/accounts/oauth/token";
+const RESOURCE: &str = "https://api.openai.com/v1";
+/// Excel 加载项等第三方应用使用的 loopback 回调。
 pub const REDIRECT_URI: &str = "http://127.0.0.1:1455/auth/callback";
-const SCOPE: &str = "openid profile email offline_access api.connectors.read api.connectors.invoke";
-const PENDING_TTL_SECONDS: u64 = 600;
+/// `chatgpt.tokens.use.direct` 是直接调用权限，缺它即无法代表用户发起推理。
+const SCOPE: &str = "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct";
+const AGENT_NAME: &str = "Excel Companion";
+const PENDING_TTL_SECONDS: u64 = 900;
 const MAX_CALLBACK_BYTES: usize = 8192;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -31,11 +36,16 @@ pub struct Session {
     pub access_token: String,
     #[serde(default)]
     pub refresh_token: String,
-    /// OpenAI 账号 ID（来自 id_token），用于覆盖账号身份头
+    /// 签发后的客户端 ID（oaiapp_…），重登与刷新都要用它
+    #[serde(default)]
+    pub client_id: String,
+    /// OpenAI 账号 ID（来自 access token 的 claims）
     #[serde(default)]
     pub openai_account_id: String,
     #[serde(default)]
     pub openai_user_id: String,
+    #[serde(default)]
+    pub scopes: Vec<String>,
     /// Unix 秒；0 表示上游未返回有效期
     #[serde(default)]
     pub expires_at: u64,
@@ -43,6 +53,9 @@ pub struct Session {
 
 #[derive(Default, Serialize, Deserialize)]
 struct Store {
+    /// 稳定的本机标识，参与 SIWC 的 `ext_agent_host_id`
+    #[serde(default)]
+    host_id: String,
     #[serde(default)]
     accounts: BTreeMap<String, Session>,
 }
@@ -71,7 +84,6 @@ fn now() -> u64 {
 }
 
 fn random_token() -> String {
-    // 两个 UUIDv4 提供约 244 位随机性，足够作为 PKCE verifier 与 state。
     let mut bytes = Vec::with_capacity(32);
     bytes.extend_from_slice(Uuid::new_v4().as_bytes());
     bytes.extend_from_slice(Uuid::new_v4().as_bytes());
@@ -103,16 +115,25 @@ fn claim(claims: &Value, name: &str) -> String {
 
 impl Auth {
     pub fn load(path: PathBuf) -> Result<Self, std::io::Error> {
-        let store = match fs::read(&path) {
+        let mut store: Store = match fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Store::default(),
             Err(error) => return Err(error),
         };
-        Ok(Self {
+        let auth = Self {
             path,
-            store: Mutex::new(store),
+            store: Mutex::new(Store::default()),
             pending: Mutex::new(BTreeMap::new()),
-        })
+        };
+        if store.host_id.is_empty() {
+            store.host_id = format!("urn:uuid:{}", Uuid::new_v4());
+            let _ = auth.save(&store);
+        }
+        *auth
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = store;
+        Ok(auth)
     }
 
     fn save(&self, store: &Store) -> Result<(), PluginFault> {
@@ -137,13 +158,26 @@ impl Auth {
         Ok(())
     }
 
-    /// 为账户生成授权链接；state 同时用于回调校验与一次性关联。
+    /// 生成 SIWC 授权链接；`state` 同时用于回调校验与一次性关联。
     pub fn start(&self, account_id: &str) -> Result<Value, PluginFault> {
         if account_id.is_empty() || account_id.len() > 128 {
             return Err(fault("invalid account id"));
         }
         let verifier = random_token();
         let state = random_token();
+        let (client_id, host_id) = {
+            let store = self
+                .store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let client = store
+                .accounts
+                .get(account_id)
+                .map(|session| session.client_id.clone())
+                .filter(|value| value.starts_with("oaiapp_"))
+                .unwrap_or_else(|| DYNAMIC_CLIENT_ID.to_owned());
+            (client, store.host_id.clone())
+        };
         let mut pending = self
             .pending
             .lock()
@@ -158,14 +192,16 @@ impl Auth {
             },
         );
         let query = [
-            ("client_id", CLIENT_ID.to_owned()),
+            ("client_id", client_id),
+            ("ext_agent_host_id", host_id),
             ("response_type", "code".to_owned()),
             ("redirect_uri", REDIRECT_URI.to_owned()),
             ("scope", SCOPE.to_owned()),
+            ("resource", RESOURCE.to_owned()),
             ("state", state.clone()),
             ("code_challenge_method", "S256".to_owned()),
             ("code_challenge", challenge(&verifier)),
-            ("prompt", "login".to_owned()),
+            ("agent_name_hint", AGENT_NAME.to_owned()),
         ];
         let encoded: Vec<String> = query
             .iter()
@@ -203,14 +239,19 @@ impl Auth {
             }
             entry
         };
-        let code =
-            extract_code(callback).ok_or_else(|| fault("callback has no authorization code"))?;
+        let code = extract_param(callback, "code")
+            .ok_or_else(|| fault("callback has no authorization code"))?;
+        // SIWC 在回调里返回签发后的客户端 ID；缺失时才退回动态客户端。
+        let client_id = extract_param(callback, "client_id")
+            .filter(|value| value.starts_with("oaiapp_"))
+            .unwrap_or_else(|| DYNAMIC_CLIENT_ID.to_owned());
         let body = [
             ("grant_type", "authorization_code".to_owned()),
-            ("client_id", CLIENT_ID.to_owned()),
+            ("client_id", client_id.clone()),
             ("code", code),
             ("code_verifier", pending.verifier.clone()),
             ("redirect_uri", REDIRECT_URI.to_owned()),
+            ("resource", RESOURCE.to_owned()),
         ]
         .iter()
         .map(|(name, value)| format!("{}={}", name, url_encode(value)))
@@ -235,7 +276,7 @@ impl Auth {
         let status = response.status;
         let bytes = response.body.collect(65536).await?;
         if status != 200 {
-            eprintln!("excel_auth: token exchange rejected with status {status}");
+            eprintln!("excel_auth: SIWC token exchange rejected with status {status}");
             return Err(fault("authorization was rejected by the identity service"));
         }
         let value: Value =
@@ -245,6 +286,19 @@ impl Auth {
             .filter(|token| !token.is_empty())
             .ok_or_else(|| fault("token response has no access token"))?
             .to_owned();
+        let scopes: Vec<String> = value["scope"]
+            .as_str()
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
+        if !scopes.is_empty()
+            && !scopes
+                .iter()
+                .any(|scope| scope == "chatgpt.tokens.use.direct")
+        {
+            return Err(fault("authorization lacks chatgpt.tokens.use.direct"));
+        }
         let claims = jwt_claims(&access_token);
         let expires_at = value["expires_in"]
             .as_u64()
@@ -257,8 +311,10 @@ impl Auth {
                 .as_str()
                 .unwrap_or_default()
                 .to_owned(),
+            client_id,
             openai_account_id: claim(&claims, "chatgpt_account_id"),
             openai_user_id: claim(&claims, "chatgpt_account_user_id"),
+            scopes,
             expires_at,
         };
         let mut store = self
@@ -281,11 +337,16 @@ impl Auth {
             .accounts
             .values()
             .map(|session| {
+                let direct = session
+                    .scopes
+                    .iter()
+                    .any(|scope| scope == "chatgpt.tokens.use.direct");
                 json!({
                     "accountId": session.account_id,
                     "expiresAt": session.expires_at,
-                    "expired": session.expires_at != 0 && session.expires_at <= now(),
+                    "expired": !direct || (session.expires_at != 0 && session.expires_at <= now()),
                     "openaiAccountId": session.openai_account_id,
+                    "scopes": session.scopes,
                 })
             })
             .collect();
@@ -304,12 +365,21 @@ impl Auth {
     }
 
     /// 账户已授权且未过期时返回可用于覆盖宿主凭据的会话。
+    ///
+    /// 只认 SIWC 授权：旧版本按 Codex OAuth 存的会话没有 direct 权限，一律视为未授权。
     pub fn session_for(&self, account_id: &str) -> Option<Session> {
         let store = self
             .store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let session = store.accounts.get(account_id)?;
+        if !session
+            .scopes
+            .iter()
+            .any(|scope| scope == "chatgpt.tokens.use.direct")
+        {
+            return None;
+        }
         if session.expires_at != 0 && session.expires_at <= now() {
             return None;
         }
@@ -331,20 +401,22 @@ fn url_encode(value: &str) -> String {
 }
 
 /// 接受完整回调地址、仅查询串或裸 code。
-fn extract_code(callback: &str) -> Option<String> {
+fn extract_param(callback: &str, name: &str) -> Option<String> {
     let query = callback
         .split_once('?')
         .map(|(_, rest)| rest)
         .unwrap_or(callback);
     for pair in query.split('&') {
-        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
-        if name == "code" && !value.is_empty() {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if key == name && !value.is_empty() {
             return Some(percent_decode(value));
         }
     }
-    let trimmed = callback.trim();
-    if !trimmed.is_empty() && !trimmed.contains(['?', '&', '=']) {
-        return Some(trimmed.to_owned());
+    if name == "code" {
+        let trimmed = callback.trim();
+        if !trimmed.is_empty() && !trimmed.contains(['?', '&', '=']) {
+            return Some(trimmed.to_owned());
+        }
     }
     None
 }
@@ -373,14 +445,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extracts_code_from_callback_shapes() {
+    fn extracts_code_and_client_from_callback() {
+        let callback =
+            "http://127.0.0.1:1455/auth/callback?code=abc123&state=x&client_id=oaiapp_Test-1";
+        assert_eq!(extract_param(callback, "code").as_deref(), Some("abc123"));
         assert_eq!(
-            extract_code("http://127.0.0.1:1455/auth/callback?code=abc123&state=x").as_deref(),
+            extract_param(callback, "client_id").as_deref(),
+            Some("oaiapp_Test-1")
+        );
+        assert_eq!(
+            extract_param("code=abc%2Fdef", "code").as_deref(),
+            Some("abc/def")
+        );
+        assert_eq!(
+            extract_param("  abc123  ", "code").as_deref(),
             Some("abc123")
         );
-        assert_eq!(extract_code("code=abc%2Fdef").as_deref(), Some("abc/def"));
-        assert_eq!(extract_code("  abc123  ").as_deref(), Some("abc123"));
-        assert!(extract_code("http://127.0.0.1:1455/auth/callback?error=denied").is_none());
+        assert!(
+            extract_param("http://127.0.0.1:1455/auth/callback?error=denied", "code").is_none()
+        );
     }
 
     #[test]
