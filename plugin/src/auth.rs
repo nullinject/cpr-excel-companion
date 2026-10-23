@@ -20,7 +20,8 @@ use uuid::Uuid;
 const DYNAMIC_CLIENT_ID: &str = "dynamic_agent_client";
 const AUTHORIZE_URL: &str = "https://auth.openai.com/api/accounts/authorize";
 const TOKEN_URL: &str = "https://auth.openai.com/api/accounts/oauth/token";
-const RESOURCE: &str = "https://api.openai.com/v1";
+/// BPS 的访问执行按 token 受众匹配；受众必须是 bps.openai.com 才会命中规则。
+const RESOURCE: &str = "https://bps.openai.com";
 /// Excel 加载项等第三方应用使用的 loopback 回调。
 pub const REDIRECT_URI: &str = "http://127.0.0.1:1455/auth/callback";
 /// `chatgpt.tokens.use.direct` 是直接调用权限，缺它即无法代表用户发起推理。
