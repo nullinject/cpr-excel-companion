@@ -37,6 +37,32 @@ const authBusy = ref('')
 const authError = ref('')
 const authPending = ref<{ accountId: string, state: string, url: string } | null>(null)
 const authCallback = ref('')
+const authCopied = ref(false)
+
+// iframe 里 window.open 会被 sandbox 拦掉，因此链接必须可见、可复制。
+async function copyAuthUrl() {
+  const url = authPending.value?.url
+  if (!url) {
+    return
+  }
+  try {
+    await navigator.clipboard.writeText(url)
+    authCopied.value = true
+  }
+  catch {
+    const input = document.getElementById('gw-auth-url') as HTMLInputElement | null
+    if (input) {
+      input.select()
+      try {
+        document.execCommand('copy')
+        authCopied.value = true
+      }
+      catch {
+        authCopied.value = false
+      }
+    }
+  }
+}
 
 async function loadAuthStatus() {
   try {
@@ -77,7 +103,8 @@ async function toggleAuth(accountId: string, next: boolean) {
     })
     authPending.value = { accountId, state: started.state, url: started.url }
     authCallback.value = ''
-    window.open(started.url, '_blank', 'noopener')
+    authCopied.value = false
+    // sandbox iframe 拦截 window.open，链接由用户复制到浏览器打开
   }
   catch {
     authError.value = '无法开始授权'
@@ -414,8 +441,21 @@ onMounted(loadAuthStatus)
               {{ authError }}
             </p>
             <div v-if="authPending" class="gw-auth-dialog" role="dialog" aria-label="完成 BPS 授权">
+              <p><strong>第 1 步</strong>：复制下面的授权链接，在浏览器新标签页打开并登录。</p>
+              <div class="gw-auth-link">
+                <input
+                  id="gw-auth-url"
+                  :value="authPending.url"
+                  readonly
+                  spellcheck="false"
+                  @focus="($event.target as HTMLInputElement).select()"
+                >
+                <button type="button" @click="copyAuthUrl">
+                  {{ authCopied ? "已复制" : "复制" }}
+                </button>
+              </div>
               <p>
-                已打开授权页。登录后浏览器会跳到
+                <strong>第 2 步</strong>：登录后浏览器会跳到
                 <code>127.0.0.1:1455</code>（页面打不开是正常的），把地址栏完整地址粘到下面。
               </p>
               <input

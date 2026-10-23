@@ -750,3 +750,25 @@
   background: transparent;
   color: var(--gw-muted);
 }
+.gw-auth-link {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+.gw-auth-link input {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+}
+.gw-auth-link button {
+  flex: 0 0 auto;
+  padding: 6px 12px;
+  border: 1px solid var(--gw-line);
+  border-radius: 8px;
+  background: var(--gw-bg);
+  color: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
